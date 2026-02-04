@@ -33,6 +33,12 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+// Struktura dla przechowywania pomiarów BH1750
+typedef struct measurement_entry_t {
+	float lux;           // Wartość natężenia światła w luksach
+	uint32_t timestamp;  // Timestamp pomiaru (HAL_GetTick())
+} measurement_entry_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -66,6 +72,19 @@ uint8_t rx_byte;
 
 // Aktualny tryb BH1750 (domyślnie ciągły wysokiej rozdzielczości)
 static uint8_t bh1750_current_mode = BH1750_CONTINUOUS_HIGH_RES_MODE;
+static uint8_t bh1750_initialized = 0;
+static uint8_t bh1750_addr = BH1750_ADDR_LOW;
+static uint8_t bh1750_addr_tried_high = 0;
+
+typedef enum {
+	BH1750_INIT_IDLE = 0,
+	BH1750_INIT_PWRON,
+	BH1750_INIT_RESET,
+	BH1750_INIT_MODE,
+	BH1750_INIT_DONE
+} bh1750_init_state_t;
+
+static bh1750_init_state_t bh1750_init_state = BH1750_INIT_IDLE;
 
 /* FRAME PARSING */
 typedef enum {
@@ -75,17 +94,8 @@ typedef enum {
 
 frame_state_t st = ST_IDLE;
 
-char frame[600];
+char frame[300];
 uint16_t pos = 0;
-
-
-char src[4], dst[4], id[3], len_str[4];
-char data[256+1];
-uint8_t crc_rx = 0;
-uint16_t len = 0;
-uint16_t data_pos = 0;
-
-uint8_t escape = 0;
 
 
 /* USER CODE END PV */
@@ -103,6 +113,8 @@ HAL_StatusTypeDef I2C_Transmit_IT(uint8_t address, uint8_t *data, uint16_t len);
 HAL_StatusTypeDef I2C_Receive_IT(uint8_t address, uint8_t *data, uint16_t len);
 uint8_t BH1750_IsTimingReady(void);
 void BH1750_StartTiming(uint32_t wait_time_ms);
+void BH1750_Init_Process(void);
+void I2C_BusRecovery_Process(void);
 void Measurement_AddEntry(float lux);
 uint16_t Measurement_GetCount(void);
 measurement_entry_t* Measurement_GetEntry(uint16_t index);
@@ -110,11 +122,13 @@ HAL_StatusTypeDef BH1750_ReadLight(float *lux);
 void Measurement_AutoRead_Process(void);
 void Measurement_SetInterval(uint32_t interval_ms);
 void Measurement_EnableAutoRead(uint8_t enable);
+uint8_t I2C_Scan_FirstAddress(uint8_t *found_addr);
+void Measurement_FillTestData(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-#define USART_TXBUF_LEN 1512 // dlaczego
+#define USART_TXBUF_LEN 1512
 #define USART_RXBUF_LEN 128
 uint8_t USART_TxBuf[USART_TXBUF_LEN];
 uint8_t USART_RxBuf[USART_RXBUF_LEN];
@@ -141,6 +155,7 @@ __IO int I2C_RX_Busy = 0;  // Odbieranie tail
 // Sygnalizacja błędów I2C
 __IO uint8_t I2C_RxBufOverflow = 0;
 __IO uint8_t I2C_Error = 0;
+__IO uint8_t I2C_BusReset_Pending = 0;
 
 // Struktura dla operacji I2C
 typedef struct {
@@ -180,12 +195,6 @@ static uint8_t bh1750_read_buffer[2] = {0};
 static float bh1750_last_lux = 0.0f;
 static uint8_t bh1750_read_ready = 0;
 
-// Struktura dla przechowywania pomiarów BH1750
-typedef struct {
-	float lux;           // Wartość natężenia światła w luksach
-	uint32_t timestamp;  // Timestamp pomiaru (HAL_GetTick())
-} measurement_entry_t;
-
 // Bufor cykliczny na 1000 wpisów pomiarów
 #define MEASUREMENT_BUFFER_SIZE 1000
 static measurement_entry_t measurement_buffer[MEASUREMENT_BUFFER_SIZE];
@@ -212,33 +221,8 @@ int16_t USART_getchar() {
 		return -1;
 } //USART_getchar
 
-uint8_t USART_getline(char *buf) {
-	static uint8_t bf[128];
-	static uint8_t idx = 0;
-	int i;
-	uint8_t ret;
-	while (USART_kbhit()) {
-		bf[idx] = USART_getchar();
-		// USART_fsend("[%02X]", bf[idx]);
-		if (((bf[idx] == 10) || (bf[idx] == 13))) {
-			bf[idx] = 0;
-			for (i = 0; i <= idx; i++) {
-				buf[i] = bf[i];
-			}
-			ret = idx;
-			idx = 0;
-			return ret;//odebrano linie
-		} else {
-			idx++;
-			if (idx >= 128)
-				idx = 0;
-		}
-	}
-	return 0;
-} //USART_getline
-
 void USART_fsend(char *format, ...) {
-	char tmp_rs[128];
+	char tmp_rs[300];  // Zwiększone dla maksymalnej ramki (271) + margines
 	int i;
 	__IO int idx;
 	va_list arglist;
@@ -269,7 +253,7 @@ void USART_fsend(char *format, ...) {
 
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
 	if (huart == &huart2) {
-		if (USART_TX_Emx`pty != USART_TX_Busy) {
+		if (USART_TX_Empty != USART_TX_Busy) {
 			uint8_t tmp = USART_TxBuf[USART_TX_Busy];
 			USART_TX_Busy++;
 			if (USART_TX_Busy >= USART_TXBUF_LEN)
@@ -280,40 +264,16 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
-	 if(huart==&huart2){
-		 USART_RX_Empty++;
-		 if(USART_RX_Empty>=USART_RXBUF_LEN)USART_RX_Empty=0;
-		 HAL_UART_Receive_IT(&huart2,&USART_RxBuf[USART_RX_Empty],1);
-	 }
-}
-
-// Funkcja wywoływana w przerwaniu odbioru
-//static uint8_t rx_byte;
-//void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-//	int next_head = (USART_RX_Empty + 1) % USART_RXBUF_LEN;
-//	if (next_head == USART_RX_Busy)
-//		USART_RxBufOverflow = 1;
-//	else {
-//		USART_RxBuf[USART_RX_Empty] = rx_byte;
-//		USART_RX_Empty = next_head;
-//	}
-//	HAL_UART_Receive_IT(huart, &rx_byte, 1);
-//}
-
-void USART2_Init(void) {
-
-	huart2.Instance = USART2;
-	huart2.Init.BaudRate = 115200;
-	huart2.Init.WordLength = UART_WORDLENGTH_8B;
-	huart2.Init.StopBits = UART_STOPBITS_1;
-	huart2.Init.Parity = UART_PARITY_NONE;
-	huart2.Init.Mode = UART_MODE_TX_RX;
-	huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-	huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-	if (HAL_UART_Init(&huart2) != HAL_OK) {
-		Error_Handler();
+	if (huart == &huart2) {
+		int next_head = (USART_RX_Empty + 1) % USART_RXBUF_LEN;
+		if (next_head == USART_RX_Busy) {
+			USART_RxBufOverflow = 1;
+		} else {
+			USART_RxBuf[USART_RX_Empty] = rx_byte;
+			USART_RX_Empty = next_head;
+		}
+		HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
 	}
-
 }
 
 // Funkcje obsługi buforów I2C
@@ -325,6 +285,16 @@ HAL_StatusTypeDef I2C_Transmit_IT(uint8_t address, uint8_t *data, uint16_t len) 
 	if (len > I2C_TXBUF_LEN) {
 		return HAL_ERROR; // Zbyt duże dane
 	}
+	
+	// Sprawdź stan HAL I2C
+	HAL_I2C_StateTypeDef state = HAL_I2C_GetState(&hi2c1);
+	if (state != HAL_I2C_STATE_READY) {
+		// Próba resetu
+		HAL_I2C_DeInit(&hi2c1);
+		HAL_I2C_Init(&hi2c1);
+		return HAL_ERROR;
+	}
+	
 	
 	// Kopiowanie danych do bufora
 	for (uint16_t i = 0; i < len; i++) {
@@ -372,6 +342,38 @@ HAL_StatusTypeDef I2C_Receive_IT(uint8_t address, uint8_t *data, uint16_t len) {
 	return status;
 }
 
+// Prosty skan I2C - zwraca pierwszy znaleziony adres (7-bit)
+uint8_t I2C_Scan_FirstAddress(uint8_t *found_addr) {
+	if (!found_addr) {
+		return 0;
+	}
+	*found_addr = 0;
+
+	HAL_I2C_StateTypeDef state = HAL_I2C_GetState(&hi2c1);
+
+	// Upewnij się, że I2C jest gotowe
+	if (state != HAL_I2C_STATE_READY) {
+		HAL_I2C_DeInit(&hi2c1);
+		HAL_Delay(10);
+		if (HAL_I2C_Init(&hi2c1) != HAL_OK) {
+			return 0;
+		}
+	}
+
+	uint8_t test_addrs[] = {0x23, 0x5C}; // BH1750 adresy
+	for (uint8_t i = 0; i < 2; i++) {
+		uint8_t addr = test_addrs[i];
+		HAL_StatusTypeDef result = HAL_I2C_IsDeviceReady(&hi2c1, addr << 1, 3, 100);
+		
+		if (result == HAL_OK) {
+			*found_addr = addr;
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
 
 // Konwersja dwóch znaków hex na bajt
 uint8_t hex2byte(char hi, char lo) {
@@ -415,9 +417,17 @@ uint8_t is_digits_only(const char *str, uint16_t len) {
 	return 1;
 }
 
+static uint8_t is_addr_char_valid(char c) {
+	return (c >= 0x21 && c <= 0x7E && c != '&' && c != '*');
+}
+
+static uint8_t is_data_char_valid(char c) {
+	return (c >= 0x20 && c <= 0x7E && c != '&' && c != '*');
+}
+
 // Funkcja do wysyłania ramki odpowiedzi
 void send_response_frame(const char *src_addr, const char *dst_addr, const char *id, const char *data) {
-	char frame[600];
+	char frame[271];
 	uint16_t pos = 0;
 	uint8_t crc_buf[300];
 	uint16_t crc_pos = 0;
@@ -445,6 +455,9 @@ void send_response_frame(const char *src_addr, const char *dst_addr, const char 
 	
 	// LEN (3 znaki) - długość danych
 	uint16_t data_len = strlen(data);
+	if (data_len > 256) {
+		return; // Przekroczony maksymalny rozmiar danych
+	}
 	char len_str[4];
 	// Formatowanie długości na 3 cyfry bez snprintf
 	len_str[0] = '0' + (data_len / 100) % 10;
@@ -509,13 +522,89 @@ void BH1750_StartTiming(uint32_t wait_time_ms) {
 }
 
 /**
+ * @brief Inicjalizacja BH1750 bez blokowania (Power On -> Reset -> Set Mode)
+ */
+void BH1750_Init_Process(void) {
+	static uint32_t last_retry_time = 0;
+	
+	if (bh1750_initialized) {
+		return;
+	}
+
+	// Inicjuj tylko gdy automatyczny pomiar jest włączony
+	if (!measurement_auto.enabled) {
+		return;
+	}
+
+	// Jeśli był błąd I2C, spróbuj drugim adresem
+	if (I2C_Error) {
+		I2C_Error = 0;
+		bh1750_initialized = 0;
+		if (!bh1750_addr_tried_high) {
+			bh1750_addr = BH1750_ADDR_HIGH;
+			bh1750_addr_tried_high = 1;
+		} else {
+			bh1750_addr = BH1750_ADDR_LOW;
+		}
+		bh1750_init_state = BH1750_INIT_IDLE;
+		return;
+	}
+
+	// Nie rozpoczynaj kolejnego kroku, jeśli I2C jest zajęte
+	if (i2c_op.pending) {
+		return;
+	}
+	
+	// Throttling - nie próbuj zbyt często (1 sekunda między próbami)
+	if (bh1750_init_state == BH1750_INIT_IDLE) {
+		uint32_t now = HAL_GetTick();
+		if (now - last_retry_time < 1000) {
+			return; // Czekaj
+		}
+		last_retry_time = now;
+	}
+
+	switch (bh1750_init_state) {
+		case BH1750_INIT_IDLE: {
+			uint8_t cmd = 0x01; // POWER ON
+			HAL_StatusTypeDef status = I2C_Transmit_IT(bh1750_addr, &cmd, 1);
+			if (status == HAL_OK) {
+				bh1750_init_state = BH1750_INIT_PWRON;
+			}
+			break;
+		}
+		case BH1750_INIT_PWRON: {
+			uint8_t cmd = 0x07; // RESET
+			if (I2C_Transmit_IT(bh1750_addr, &cmd, 1) == HAL_OK) {
+				bh1750_init_state = BH1750_INIT_RESET;
+			}
+			break;
+		}
+		case BH1750_INIT_RESET: {
+			if (BH1750_SetMode(bh1750_current_mode) == HAL_OK) {
+				bh1750_init_state = BH1750_INIT_MODE;
+			}
+			break;
+		}
+		case BH1750_INIT_MODE:
+			if (!i2c_op.pending) {
+				bh1750_initialized = 1;
+				bh1750_init_state = BH1750_INIT_DONE;
+			}
+			break;
+		default:
+			break;
+	}
+}
+
+/**
  * @brief Ustawienie trybu pracy czujnika BH1750 (przez przerwania, bez HAL_Delay)
  * @param mode: Tryb pracy (jedna z komend BH1750: 0x10, 0x11, 0x13, 0x20, 0x21, 0x23)
  * @retval HAL_StatusTypeDef
  */
 HAL_StatusTypeDef BH1750_SetMode(uint8_t mode) {
 	HAL_StatusTypeDef status;
-	uint8_t addr = BH1750_ADDR_LOW; // Adres I2C (7-bit, bez przesunięcia - funkcja I2C_Transmit_IT zrobi to)
+	uint8_t addr = bh1750_addr; // Adres I2C (7-bit, bez przesunięcia - funkcja I2C_Transmit_IT zrobi to)
 	
 	// Wysyłanie komendy trybu do czujnika przez przerwania
 	status = I2C_Transmit_IT(addr, &mode, 1);
@@ -556,6 +645,17 @@ void Measurement_AddEntry(float lux) {
 	}
 }
 
+// Tymczasowe wypełnienie bufora pomiarów danymi testowymi (stałe wartości)
+void Measurement_FillTestData(void) {
+	static const float test_values[] = {
+		10.0f, 100.0f, 250.0f, 500.0f, 750.0f,
+		1000.0f, 1500.0f, 2000.0f, 3500.0f, 5000.0f
+	};
+	for (uint16_t i = 0; i < (uint16_t)(sizeof(test_values) / sizeof(test_values[0])); i++) {
+		Measurement_AddEntry(test_values[i]);
+	}
+}
+
 /**
  * @brief Pobranie liczby zapisanych pomiarów
  * @retval Liczba pomiarów (0-1000)
@@ -588,18 +688,13 @@ measurement_entry_t* Measurement_GetEntry(uint16_t index) {
 	return &measurement_buffer[real_index];
 }
 
-// Bufor do odczytu BH1750
-static uint8_t bh1750_read_buffer[2] = {0};
-static float bh1750_last_lux = 0.0f;
-static uint8_t bh1750_read_ready = 0;
-
 /**
  * @brief Odczyt wartości natężenia światła z BH1750 (przez przerwania)
  * @param lux: Wskaźnik do zmiennej, gdzie zostanie zapisana wartość w luksach
  * @retval HAL_StatusTypeDef
  */
 HAL_StatusTypeDef BH1750_ReadLight(float *lux) {
-	uint8_t addr = BH1750_ADDR_LOW;
+	uint8_t addr = bh1750_addr;
 	
 	// Sprawdzenie czy operacja I2C nie jest w toku
 	if (i2c_op.pending) {
@@ -645,163 +740,250 @@ void Measurement_AutoRead_Process(void) {
 	if (!measurement_auto.enabled) {
 		return; // Automatyczny odczyt wyłączony
 	}
+	if (!bh1750_initialized) {
+		return; // Czekaj na zakończenie inicjalizacji BH1750
+	}
 	
+	// Sprawdzenie czy dane z odczytu są gotowe i zapisanie ich
+	if (bh1750_read_ready) {
+		// Zapis pomiaru do bufora
+		Measurement_AddEntry(bh1750_last_lux);
+		bh1750_read_ready = 0; // Wyzeruj flagę po zapisaniu
+	}
+
 	// Sprawdzenie czy minął interwał
 	uint32_t current_time = HAL_GetTick();
 	if ((current_time - measurement_auto.last_measurement) >= measurement_auto.interval_ms) {
-		// Sprawdzenie czy I2C nie jest zajęty i czy czujnik jest gotowy
-		if (!i2c_op.pending && BH1750_IsTimingReady()) {
-			// Sprawdzenie czy ostatni odczyt jest gotowy
-			if (bh1750_read_ready) {
-				// Zapis pomiaru do bufora
-				Measurement_AddEntry(bh1750_last_lux);
-				measurement_auto.last_measurement = current_time;
-				bh1750_read_ready = 0;
-			} else {
-				// Rozpoczęcie nowego odczytu
-				BH1750_ReadLight(&bh1750_last_lux); // Rozpocznie asynchroniczny odczyt
+		measurement_auto.last_measurement = current_time; // Zaktualizuj czas
+		
+		// Sprawdzenie czy I2C nie jest zajęty
+		if (!i2c_op.pending) {
+			// Rozpoczęcie nowego odczytu z czujnika
+			bh1750_read_ready = 0; // Wyzeruj flagę przed rozpoczęciem odczytu
+			HAL_StatusTypeDef status = BH1750_ReadLight(&bh1750_last_lux);
+			
+			// Jeśli I2C zawiódł, dodaj wartość 0 jako wskaźnik błędu
+			if (status != HAL_OK) {
+				Measurement_AddEntry(0.0f); // Błąd I2C
 			}
 		}
 	}
 }
 
 void handle_command(char *cmd, const char *src_addr, const char *dst_addr, const char *id) {
-	// Domyślny adres urządzenia (można zmienić na właściwy)
-	const char *device_addr = "PC_";
+	const char *device_addr = dst_addr;
 	
-	// Zakres dozwolonych wartości interwału (można dostosować)
+	// Zakres dozwolonych wartości interwału
 	const uint16_t MIN_INTERVAL = 1;
-	const uint16_t MAX_INTERVAL = 3600;
+	const uint16_t MAX_INTERVAL = 9999;
 	
-	if (strcmp(cmd, "START") == 0) {
-		Measurement_EnableAutoRead(1); // Włączenie automatycznego odczytu
-		send_response_frame(device_addr, src_addr, id, "OK_START");
-	} else if (strcmp(cmd, "STOP") == 0) {
-		Measurement_EnableAutoRead(0); // Wyłączenie automatycznego odczytu
-		send_response_frame(device_addr, src_addr, id, "OK_STOP");
-	} else if (strcmp(cmd, "ALL") == 0) {
-		send_response_frame(device_addr, src_addr, id, "OK_ALL");
-	} else if (strncmp(cmd, "VIEW_ONE", 8) == 0) {
-		char response[270];
-		// Konkatenacja "OK_" z cmd bez snprintf
-		memcpy(response, "OK_", 3);
-		uint16_t cmd_len = strlen(cmd);
-		memcpy(&response[3], cmd, cmd_len);
-		response[3 + cmd_len] = 0;
+	// Sprawdzenie minimalnej długości (kod komendy = 2 cyfry)
+	if (strlen(cmd) < 2 || !is_digits_only(cmd, 2)) {
+		send_response_frame(device_addr, src_addr, id, "01"); // ERR_PARAM
+		return;
+	}
+	
+	// Wyodrębnienie kodu komendy (pierwsze 2 cyfry)
+	uint8_t cmd_code = (cmd[0] - '0') * 10 + (cmd[1] - '0');
+	const char *params = (strlen(cmd) > 2) ? &cmd[2] : "";
+	
+	// 10 - START
+	if (cmd_code == 10) {
+		Measurement_EnableAutoRead(1);
+		send_response_frame(device_addr, src_addr, id, "00"); // OK
+	}
+	// 11 - STOP
+	else if (cmd_code == 11) {
+		Measurement_EnableAutoRead(0);
+		send_response_frame(device_addr, src_addr, id, "00"); // OK
+	}
+	// 12 - DOWNLOAD (ostatni pomiar)
+	else if (cmd_code == 12) {
+		uint16_t count = Measurement_GetCount();
+		if (count == 0) {
+			send_response_frame(device_addr, src_addr, id, "03"); // ERR_NO_DATA
+			return;
+		}
+		measurement_entry_t *entry = Measurement_GetEntry(count - 1);
+		if (!entry) {
+			send_response_frame(device_addr, src_addr, id, "03"); // ERR_NO_DATA
+			return;
+		}
+		uint32_t lux_val = (uint32_t)(entry->lux + 0.5f);
+		if (lux_val > 9999) {
+			lux_val = 9999;
+		}
+		char response[5];
+		response[0] = '0' + (lux_val / 1000) % 10;
+		response[1] = '0' + (lux_val / 100) % 10;
+		response[2] = '0' + (lux_val / 10) % 10;
+		response[3] = '0' + lux_val % 10;
+		response[4] = 0;
 		send_response_frame(device_addr, src_addr, id, response);
-	} else if (strncmp(cmd, "SET_INTERVAL", 12) == 0) {
-		// Komenda SET_INTERVAL - ustawienie interwału pomiarowego
-		// Format: SET_INTERVALxxxx gdzie xxxx to interwał w sekundach (np. SET_INTERVAL005 = 5 sekund)
+	}
+	// 13 - VIEW (+ xxzz parametry)
+	else if (cmd_code == 13) {
+		if (strlen(params) < 4 || !is_digits_only(params, 4)) {
+			send_response_frame(device_addr, src_addr, id, "01"); // ERR_PARAM
+			return;
+		}
+		uint8_t start_offset = (params[0] - '0') * 10 + (params[1] - '0');
+		uint8_t count_req = (params[2] - '0') * 10 + (params[3] - '0');
+		if (count_req == 0) {
+			send_response_frame(device_addr, src_addr, id, "01"); // ERR_PARAM
+			return;
+		}
+		uint16_t count = Measurement_GetCount();
 		
-		if (strlen(cmd) < 16) { // SET_INTERVAL + 4 cyfry = 16 znaków
-			send_response_frame(device_addr, src_addr, id, "ERR_INVALID_PARAM");
+		// Sprawdzenie czy offset nie przekracza liczby pomiarów
+		if (start_offset >= count) {
+			send_response_frame(device_addr, src_addr, id, "03"); // ERR_NO_DATA
 			return;
 		}
 		
-		// Wyodrębnienie parametru (4 cyfry po "SET_INTERVAL")
-		const char *param_str = &cmd[12];
+		// Maksymalna liczba pomiarów na ramkę: (256 - 2) / 4 = 63
+		// Format: xxLLLLLLLLLLLL... (offset 2 znaki + N*4 znaki lux)
+		#define MAX_MEASUREMENTS_PER_FRAME 63
+		char data_out[256];
+		uint8_t measurements_sent = 0;
 		
-		// Sprawdzenie czy parametr zawiera tylko cyfry
-		if (!is_digits_only(param_str, 4)) {
-			send_response_frame(device_addr, src_addr, id, "ERR_INVALID_PARAM");
+		while (measurements_sent < count_req) {
+			uint8_t current_offset = start_offset + measurements_sent;
+			uint8_t batch_size = 0;
+			uint16_t data_pos = 0;
+			
+			// Offset (2 znaki)
+			data_out[data_pos++] = '0' + (current_offset / 10) % 10;
+			data_out[data_pos++] = '0' + current_offset % 10;
+			
+			// Pakowanie pomiarów do ramki
+			for (uint8_t i = 0; i < MAX_MEASUREMENTS_PER_FRAME && measurements_sent < count_req; i++) {
+				int32_t idx = (int32_t)count - 1 - (int32_t)current_offset - (int32_t)i;
+				if (idx < 0) {
+					break;
+				}
+				measurement_entry_t *entry = Measurement_GetEntry((uint16_t)idx);
+				if (!entry) {
+					break;
+				}
+				uint32_t lux_val = (uint32_t)(entry->lux + 0.5f);
+				if (lux_val > 9999) {
+					lux_val = 9999;
+				}
+				// Dodanie 4-cyfrowej wartości lux
+				data_out[data_pos++] = '0' + (lux_val / 1000) % 10;
+				data_out[data_pos++] = '0' + (lux_val / 100) % 10;
+				data_out[data_pos++] = '0' + (lux_val / 10) % 10;
+				data_out[data_pos++] = '0' + lux_val % 10;
+				batch_size++;
+				measurements_sent++;
+			}
+			
+			data_out[data_pos] = 0;
+			send_response_frame(device_addr, src_addr, id, data_out);
+			
+			// Jeśli nie wysłano żadnych pomiarów, przerwij
+			if (batch_size == 0) {
+				break;
+			}
+		}
+	}
+	// 14 - SET_INTERVAL (+ xxxx parametr)
+	else if (cmd_code == 14) {
+		if (strlen(params) < 4 || !is_digits_only(params, 4)) {
+			send_response_frame(device_addr, src_addr, id, "01"); // ERR_PARAM
 			return;
 		}
-		
-		// Konwersja parametru na liczbę (sekundy)
-		uint16_t interval_sec = atoi(param_str);
-		
-		// Sprawdzenie zakresu wartości (1-3600 sekund)
-		if (interval_sec < MIN_INTERVAL || interval_sec > MAX_INTERVAL) {
-			send_response_frame(device_addr, src_addr, id, "ERR_INVALID_PARAM");
+		uint16_t interval_ms = atoi(params);
+		if (interval_ms < MIN_INTERVAL || interval_ms > MAX_INTERVAL) {
+			send_response_frame(device_addr, src_addr, id, "02"); // ERR_RANGE
 			return;
 		}
-		
-		// Ustawienie interwału (konwersja sekund na milisekundy)
-		Measurement_SetInterval(interval_sec * 1000);
-		
-		char response[50];
-		memcpy(response, "OK_SET_INTERVAL", 15);
-		memcpy(&response[15], param_str, 4);
-		response[19] = 0;
+		Measurement_SetInterval(interval_ms);
+		send_response_frame(device_addr, src_addr, id, "00"); // OK
+	}
+	// 15 - GET_INTERVAL
+	else if (cmd_code == 15) {
+		uint16_t interval_ms = measurement_auto.interval_ms;
+		if (interval_ms > 9999) {
+			interval_ms = 9999;
+		}
+		char response[6];
+		response[0] = '0' + (interval_ms / 1000) % 10;
+		response[1] = '0' + (interval_ms / 100) % 10;
+		response[2] = '0' + (interval_ms / 10) % 10;
+		response[3] = '0' + interval_ms % 10;
+		response[4] = 0;
 		send_response_frame(device_addr, src_addr, id, response);
-	} else if (strcmp(cmd, "GET_INTERVAL") == 0) {
-		// Zwrócenie aktualnego interwału
-		uint16_t interval_sec = measurement_auto.interval_ms / 1000;
-		char response[50];
-		memcpy(response, "OK_INTERVAL", 11);
-		// Formatowanie interwału na 4 cyfry
-		response[11] = '0' + (interval_sec / 1000) % 10;
-		response[12] = '0' + (interval_sec / 100) % 10;
-		response[13] = '0' + (interval_sec / 10) % 10;
-		response[14] = '0' + interval_sec % 10;
-		response[15] = 0;
-		send_response_frame(device_addr, src_addr, id, response);
-	} else if (strncmp(cmd, "SET_MODE", 8) == 0) {	
-		if (strlen(cmd) < 9) {
-			// Zbyt krótka komenda - brak parametru
-			send_response_frame(device_addr, src_addr, id, "ERR_INVALID_PARAM");
+	}
+	// 16 - SET_MODE (+ x parametr)
+	else if (cmd_code == 16) {
+		if (strlen(params) < 1 || params[0] < '1' || params[0] > '6') {
+			send_response_frame(device_addr, src_addr, id, "01"); // ERR_PARAM
 			return;
 		}
-		
-		// Wyodrębnienie parametru (cyfra po "SET_MODE")
-		char mode_char = cmd[8];
-		
-		// Sprawdzenie czy to cyfra
-		if (mode_char < '1' || mode_char > '6') {
-			send_response_frame(device_addr, src_addr, id, "ERR_INVALID_PARAM");
-			return;
-		}
-		
-		// Konwersja cyfry na numer trybu (1-6)
-		uint8_t mode_num = mode_char - '0';
-		
-		// Mapowanie numeru trybu na wartość hex BH1750
+		uint8_t mode_num = params[0] - '0';
 		uint8_t mode_value;
 		switch (mode_num) {
-			case 1:
-				mode_value = BH1750_CONTINUOUS_HIGH_RES_MODE;    // 0x10
-				break;
-			case 2:
-				mode_value = BH1750_CONTINUOUS_HIGH_RES_MODE_2; // 0x11
-				break;
-			case 3:
-				mode_value = BH1750_CONTINUOUS_LOW_RES_MODE;    // 0x13
-				break;
-			case 4:
-				mode_value = BH1750_ONETIME_HIGH_RES_MODE;     // 0x20
-				break;
-			case 5:
-				mode_value = BH1750_ONETIME_HIGH_RES_MODE_2;    // 0x21
-				break;
-			case 6:
-				mode_value = BH1750_ONETIME_LOW_RES_MODE;        // 0x23
-				break;
+			case 1: mode_value = BH1750_CONTINUOUS_HIGH_RES_MODE; break;
+			case 2: mode_value = BH1750_CONTINUOUS_HIGH_RES_MODE_2; break;
+			case 3: mode_value = BH1750_CONTINUOUS_LOW_RES_MODE; break;
+			case 4: mode_value = BH1750_ONETIME_HIGH_RES_MODE; break;
+			case 5: mode_value = BH1750_ONETIME_HIGH_RES_MODE_2; break;
+			case 6: mode_value = BH1750_ONETIME_LOW_RES_MODE; break;
 			default:
-				send_response_frame(device_addr, src_addr, id, "ERR_INVALID_PARAM");
+				send_response_frame(device_addr, src_addr, id, "01"); // ERR_PARAM
 				return;
 		}
-		
-		// Ustawienie trybu
 		HAL_StatusTypeDef status = BH1750_SetMode(mode_value);
-		
 		if (status == HAL_OK) {
-			char response[50];
-			// Konkatenacja "OK_SET_MODE" z cyfrą bez snprintf
-			memcpy(response, "OK_SET_MODE", 11);
-			response[11] = '0' + mode_num;
-			response[12] = 0;
+			send_response_frame(device_addr, src_addr, id, "00"); // OK
+		} else {
+			send_response_frame(device_addr, src_addr, id, "04"); // ERR_I2C
+		}
+	}
+	// 17 - GET_MODE
+	else if (cmd_code == 17) {
+		char mode_char = '1';
+		switch (bh1750_current_mode) {
+			case BH1750_CONTINUOUS_HIGH_RES_MODE: mode_char = '1'; break;
+			case BH1750_CONTINUOUS_HIGH_RES_MODE_2: mode_char = '2'; break;
+			case BH1750_CONTINUOUS_LOW_RES_MODE: mode_char = '3'; break;
+			case BH1750_ONETIME_HIGH_RES_MODE: mode_char = '4'; break;
+			case BH1750_ONETIME_HIGH_RES_MODE_2: mode_char = '5'; break;
+			case BH1750_ONETIME_LOW_RES_MODE: mode_char = '6'; break;
+			default: mode_char = '1'; break;
+		}
+		char response[2];
+		response[0] = mode_char;
+		response[1] = 0;
+		send_response_frame(device_addr, src_addr, id, response);
+	}
+	// 18 - I2C_SCAN (zwraca pierwszy znaleziony adres)
+	else if (cmd_code == 18) {
+		uint8_t found_addr = 0;
+		char response[5];
+		if (I2C_Scan_FirstAddress(&found_addr)) {
+			// Odpowiedź: hex adresu (2 znaki)
+			byte2hex(found_addr, &response[0]);
+			response[2] = 0;
 			send_response_frame(device_addr, src_addr, id, response);
 		} else {
-			send_response_frame(device_addr, src_addr, id, "ERR_I2C");
+			// Brak urządzeń - wysyłamy "00"
+			response[0] = '0';
+			response[1] = '0';
+			response[2] = 0;
+			send_response_frame(device_addr, src_addr, id, response);
 		}
-	} else {
-		send_response_frame(device_addr, src_addr, id, "ERR_UNKNOWN_CMD");
+	}
+	// Nieznany kod komendy
+	else {
+		send_response_frame(device_addr, src_addr, id, "01"); // ERR_PARAM
 	}
 }
 
 void validate_frame(char *f, uint16_t flen)
 {
-	const char *device_addr = "PC_";
 	char src[4], dst[4], id[3], len_str[4];
 	
 	/* ====== Sprawdzenie minimalnej długości ramki ====== */
@@ -835,6 +1017,14 @@ void validate_frame(char *f, uint16_t flen)
 	memcpy(dst, &f[pos], 3); dst[3]=0; pos+=3;
 	memcpy(id,  &f[pos], 2); id[2]=0;  pos+=2;
 	memcpy(len_str, &f[pos], 3); len_str[3]=0; pos+=3;
+	const char *device_addr = dst;
+
+	/* ====== Walidacja znaków SRC/DST ====== */
+	for (uint8_t i = 0; i < 3; i++) {
+		if (!is_addr_char_valid(src[i]) || !is_addr_char_valid(dst[i])) {
+			return;
+		}
+	}
 
 	/* ====== Sprawdzenie formatu ID (tylko cyfry 0-9) ====== */
 	if(!is_digits_only(id, 2))
@@ -861,28 +1051,31 @@ void validate_frame(char *f, uint16_t flen)
 
 	/* ====== Sprawdzenie faktycznej długości danych ====== */
 	uint16_t data_start = pos;
-	uint16_t crc_pos = flen - 3;   // 2 znaki CRC + '*'
 	
 	// Sprawdzenie czy ramka jest wystarczająco długa dla deklarowanej długości danych
-	if(flen < (data_start + data_len_declared + 2 + 1)) // data_start + data_len + CRC(2) + '*'
+	// Minimalna długość: & + SRC(3) + DST(3) + ID(2) + LEN(3) + DATA + CRC(2) + * = 14 + DATA
+	if(flen < (data_start + data_len_declared + 3)) // data_start + data_len + CRC(2) + '*'(1)
 	{
 		send_response_frame(device_addr, src, id, "ERR_LENGTH");
 		return;
 	}
 	
-	uint16_t data_len_real = crc_pos - data_start;
-
-	/* ====== Sprawdzenie zgodności długości ====== */
-	if(data_len_real != data_len_declared)
-	{
-		send_response_frame(device_addr, src, id, "ERR_LENGTH");
-		return;
-	}
+	// CRC jest 3 znaki od końca (CRC ma 2 znaki + '*')
+	uint16_t crc_pos = data_start + data_len_declared;
+	uint16_t data_len_real = data_len_declared;
 
 	/* ====== Odczyt danych ====== */
 	char data[257];
 	memcpy(data, &f[data_start], data_len_real);
 	data[data_len_real] = 0;
+
+	/* ====== Walidacja znaków DATA ====== */
+	for (uint16_t i = 0; i < data_len_real; i++) {
+		if (!is_data_char_valid(data[i])) {
+			send_response_frame(device_addr, src, id, "ERR");
+			return;
+		}
+	}
 
 	/* ====== Sprawdzenie czy mamy CRC ====== */
 	if(flen < (crc_pos + 2))
@@ -914,20 +1107,9 @@ void validate_frame(char *f, uint16_t flen)
 		send_response_frame(device_addr, src, id, "ERR_CRC");
 		return;
 	}
-
-	/* ====== SUKCES - Przetwarzanie komendy ====== */
-	USART_fsend("\nFRAME OK\r\n");
-	USART_fsend("\nSRC=%s DST=%s ID=%s LEN=%d DATA=%s\r\n",
-				src, dst, id, data_len_real, data);
-
+	
 	// Przekazanie informacji o ramce do obsługi komendy
 	handle_command(data, src, dst, id);
-}
-
-void reset_frame(void)
-{
-    pos = 0;
-    st = ST_IDLE;
 }
 
 // Funkcja sprawdzająca i przetwarzająca ramki w buforze kołowym
@@ -1008,19 +1190,25 @@ int main(void)
   MX_USART2_UART_Init();
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
+	// Inicjalizacja BH1750 wykonywana bez blokowania w pętli głównej
+	USART_fsend("\r\nSYSTEM START\r\n");
+	// Tymczasowe dane testowe do sprawdzenia komend (stałe wartości)
+	Measurement_FillTestData();
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 	HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
-
+	
 	while (1) {
 
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+		I2C_BusRecovery_Process();
 		process_uart_buffer();
+		BH1750_Init_Process();
 		Measurement_AutoRead_Process(); // Automatyczny odczyt pomiarów co interwał
 
 //    	while(USART_kbhit()) {
@@ -1234,10 +1422,54 @@ void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c) {
 	if (hi2c == &hi2c1) {
 		I2C_Error = 1;
 		i2c_op.pending = 0;
-		// Reset błędu I2C
-		HAL_I2C_DeInit(&hi2c1);
-		HAL_I2C_Init(&hi2c1);
+		I2C_BusReset_Pending = 1;
 	}
+}
+
+void I2C_BusRecovery_Process(void) {
+	static uint32_t last_reset = 0;
+
+	if (!I2C_BusReset_Pending) {
+		return;
+	}
+
+	uint32_t now = HAL_GetTick();
+	if (now - last_reset < 100) {
+		return;
+	}
+	last_reset = now;
+	I2C_BusReset_Pending = 0;
+
+	// 1. Wyłącz I2C
+	__HAL_I2C_DISABLE(&hi2c1);
+
+	// 2. Skonfiguruj piny jako GPIO
+	GPIO_InitTypeDef GPIO_InitStruct = {0};
+	GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7; // PB6=SCL, PB7=SDA
+	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+	GPIO_InitStruct.Pull = GPIO_PULLUP;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+	HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+	// 3. Wygeneruj 9 pulsów zegarowych żeby uwolnić SDA
+	for (int i = 0; i < 9; i++) {
+		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET); // SCL LOW
+		HAL_Delay(1);
+		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);   // SCL HIGH
+		HAL_Delay(1);
+	}
+
+	// 4. Wygeneruj STOP condition
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET); // SDA LOW
+	HAL_Delay(1);
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);   // SCL HIGH
+	HAL_Delay(1);
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET);   // SDA HIGH
+	HAL_Delay(1);
+
+	// 5. Przywróć konfigurację I2C
+	HAL_I2C_DeInit(&hi2c1);
+	HAL_I2C_Init(&hi2c1);
 }
 
 /* USER CODE END 4 */

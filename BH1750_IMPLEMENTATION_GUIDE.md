@@ -3,6 +3,7 @@
 ## 📋 Lista wymaganych elementów
 
 ### 1. Sprzęt
+
 - ✅ **Czujnik BH1750** (moduł z czujnikiem światła)
 - ✅ **Rezystory podciągające** 4.7 kΩ (2 sztuki) - jeśli moduł nie ma wbudowanych
 - ✅ **Przewody połączeniowe** (jumper wires)
@@ -11,6 +12,7 @@
 ### 2. Podłączenie do STM32F446RE
 
 #### Opcja A: I2C1 (zalecane)
+
 ```
 BH1750          STM32F446RE
 ─────────────────────────────
@@ -22,6 +24,7 @@ ADDR     →      GND  (adres 0x23) lub VCC (adres 0x5C)
 ```
 
 #### Opcja B: I2C2
+
 ```
 BH1750          STM32F446RE
 ─────────────────────────────
@@ -33,17 +36,19 @@ ADDR     →      GND  (adres 0x23) lub VCC (adres 0x5C)
 ```
 
 #### Opcja C: I2C1 alternatywne piny
+
 ```
 BH1750          STM32F446RE
 ─────────────────────────────
 VCC      →      3.3V (lub 5V)
 GND      →      GND
-SDA      →      PB9  (I2C1_SDA alternatywny)
-SCL      →      PB8  (I2C1_SCL alternatywny)
+SDA      →      PB7  (I2C1_SDA alternatywny)
+SCL      →      PB6  (I2C1_SCL alternatywny)
 ADDR     →      GND  (adres 0x23) lub VCC (adres 0x5C)
 ```
 
 **Uwaga:** Jeśli moduł BH1750 nie ma wbudowanych rezystorów podciągających, dodaj:
+
 - Rezystor 4.7 kΩ między SDA a VCC
 - Rezystor 4.7 kΩ między SCL a VCC
 
@@ -52,15 +57,16 @@ ADDR     →      GND  (adres 0x23) lub VCC (adres 0x5C)
 ## 🔧 Konfiguracja w STM32CubeIDE
 
 ### Krok 1: Otwórz plik .ioc
+
 - Otwórz plik `Banaszek_Project.ioc` w STM32CubeIDE
 
 ### Krok 2: Skonfiguruj I2C1
+
 1. W zakładce **Pinout & Configuration**:
    - Znajdź **I2C1** w liście peryferiów
    - Kliknij na **I2C1**
    - W **Mode** wybierz:
      - ✅ **I2C** (nie I2C SMBus)
-   
 2. W **Configuration** → **I2C1**:
    - **I2C Speed Frequency:** 100000 Hz (100 kHz - standardowa prędkość)
    - **Clock Speed:** 100000 Hz
@@ -73,11 +79,13 @@ ADDR     →      GND  (adres 0x23) lub VCC (adres 0x5C)
    - Kliknij na pin **PB7** → wybierz **I2C1_SDA**
 
 ### Krok 3: Skonfiguruj NVIC (opcjonalnie - dla przerwań)
+
 1. W **System Core** → **NVIC**:
    - Włącz **I2C1 event interrupt** (opcjonalnie)
    - Włącz **I2C1 error interrupt** (opcjonalnie)
 
 ### Krok 4: Wygeneruj kod
+
 1. Kliknij **Project** → **Generate Code** (lub Ctrl+Alt+G)
 2. STM32CubeIDE wygeneruje:
    - `MX_I2C1_Init()` w `main.c`
@@ -89,6 +97,7 @@ ADDR     →      GND  (adres 0x23) lub VCC (adres 0x5C)
 ## 📁 Struktura plików do dodania
 
 ### Pliki do utworzenia:
+
 ```
 Core/
 ├── Inc/
@@ -102,6 +111,7 @@ Core/
 ## 💻 Kod do implementacji
 
 ### 1. Plik: `Core/Inc/bh1750.h`
+
 ```c
 #ifndef BH1750_H
 #define BH1750_H
@@ -133,6 +143,7 @@ HAL_StatusTypeDef BH1750_Reset(I2C_HandleTypeDef *hi2c, uint8_t address);
 ```
 
 ### 2. Plik: `Core/Src/bh1750.c`
+
 ```c
 #include "bh1750.h"
 #include <math.h>
@@ -145,19 +156,19 @@ HAL_StatusTypeDef BH1750_Reset(I2C_HandleTypeDef *hi2c, uint8_t address);
  */
 HAL_StatusTypeDef BH1750_Init(I2C_HandleTypeDef *hi2c, uint8_t address) {
     HAL_StatusTypeDef status;
-    
+
     // Włączenie czujnika
     status = BH1750_SetMode(hi2c, address, BH1750_POWER_ON);
     if (status != HAL_OK) return status;
-    
+
     HAL_Delay(10); // Krótkie opóźnienie po włączeniu
-    
+
     // Ustawienie trybu ciągłego pomiaru, wysoka rozdzielczość
     status = BH1750_SetMode(hi2c, address, BH1750_CONTINUOUS_H_RES_MODE);
     if (status != HAL_OK) return status;
-    
+
     HAL_Delay(120); // Czas na pierwszy pomiar (120ms dla H_RES_MODE)
-    
+
     return HAL_OK;
 }
 
@@ -193,19 +204,19 @@ HAL_StatusTypeDef BH1750_ReadLight(I2C_HandleTypeDef *hi2c, uint8_t address, flo
     uint8_t data[2];
     HAL_StatusTypeDef status;
     uint16_t raw_value;
-    
+
     // Odczyt 2 bajtów danych
     status = HAL_I2C_Master_Receive(hi2c, (address << 1) | 0x01, data, 2, HAL_MAX_DELAY);
     if (status != HAL_OK) {
         return status;
     }
-    
+
     // Konwersja bajtów na 16-bitową wartość (big-endian)
     raw_value = (data[0] << 8) | data[1];
-    
+
     // Przeliczenie na luksy: wartość / 1.2 (dla trybu H_RES_MODE)
     *lux = raw_value / 1.2f;
-    
+
     return HAL_OK;
 }
 ```
@@ -213,6 +224,7 @@ HAL_StatusTypeDef BH1750_ReadLight(I2C_HandleTypeDef *hi2c, uint8_t address, flo
 ### 3. Modyfikacje w `main.c`
 
 #### a) Dodaj include:
+
 ```c
 /* USER CODE BEGIN Includes */
 #include "bh1750.h"
@@ -220,6 +232,7 @@ HAL_StatusTypeDef BH1750_ReadLight(I2C_HandleTypeDef *hi2c, uint8_t address, flo
 ```
 
 #### b) Dodaj zmienną handle I2C (jeśli nie została wygenerowana):
+
 ```c
 /* Private variables ---------------------------------------------------------*/
 UART_HandleTypeDef huart2;
@@ -227,28 +240,29 @@ I2C_HandleTypeDef hi2c1;  // Dodaj tę linię
 ```
 
 #### c) Przykład użycia w main():
+
 ```c
 int main(void) {
     // ... istniejący kod inicjalizacji ...
-    
+
     /* USER CODE BEGIN 2 */
     // Inicjalizacja BH1750
     if (BH1750_Init(&hi2c1, BH1750_ADDR_LOW) != HAL_OK) {
         Error_Handler();
     }
     /* USER CODE END 2 */
-    
+
     while (1) {
         /* USER CODE BEGIN 3 */
         float light_level;
-        
+
         // Odczyt natężenia światła
         if (BH1750_ReadLight(&hi2c1, BH1750_ADDR_LOW, &light_level) == HAL_OK) {
             USART_fsend("Light: %.2f lx\r\n", light_level);
         } else {
             USART_fsend("Error reading BH1750\r\n");
         }
-        
+
         HAL_Delay(1000); // Odczyt co sekundę
         /* USER CODE END 3 */
     }
@@ -260,12 +274,14 @@ int main(void) {
 ## ✅ Checklist implementacji
 
 ### Konfiguracja sprzętowa:
+
 - [ ] Podłączony czujnik BH1750 do STM32F446RE
 - [ ] Rezystory podciągające 4.7kΩ (jeśli potrzebne)
 - [ ] Zasilanie 3.3V lub 5V
 - [ ] Połączenie masy (GND)
 
 ### Konfiguracja oprogramowania:
+
 - [ ] Skonfigurowany I2C1 w STM32CubeIDE (.ioc)
 - [ ] Przypisane piny PB6 (SCL) i PB7 (SDA)
 - [ ] Wygenerowany kod z STM32CubeIDE
@@ -276,6 +292,7 @@ int main(void) {
 - [ ] Dodany kod odczytu w pętli głównej
 
 ### Testowanie:
+
 - [ ] Kompilacja bez błędów
 - [ ] Wgranie programu do mikrokontrolera
 - [ ] Sprawdzenie komunikacji I2C (odczyt wartości)
@@ -286,6 +303,7 @@ int main(void) {
 ## 🔍 Rozwiązywanie problemów
 
 ### Problem: Brak komunikacji z czujnikiem
+
 - ✅ Sprawdź połączenia SDA i SCL
 - ✅ Sprawdź zasilanie (3.3V lub 5V)
 - ✅ Sprawdź rezystory podciągające
@@ -293,11 +311,13 @@ int main(void) {
 - ✅ Użyj oscyloskopu/logic analyzer do sprawdzenia sygnałów I2C
 
 ### Problem: Błędne odczyty
+
 - ✅ Sprawdź czas opóźnienia po inicjalizacji (120ms dla H_RES_MODE)
 - ✅ Sprawdź czy czujnik jest w odpowiednim trybie
 - ✅ Sprawdź czy nie ma zakłóceń elektromagnetycznych
 
 ### Problem: Błąd kompilacji - brak math.h
+
 - ✅ Dodaj `#include <math.h>` w `bh1750.c` (już jest w przykładzie)
 
 ---
@@ -305,15 +325,18 @@ int main(void) {
 ## 📚 Dodatkowe informacje
 
 ### Adresy I2C:
+
 - **0x23** - gdy ADDR pin podłączony do GND (domyślny)
 - **0x5C** - gdy ADDR pin podłączony do VCC
 
 ### Tryby pomiaru:
+
 - **H_RES_MODE** (0x10): 1 lx, 120ms - zalecany
 - **H_RES_MODE2** (0x11): 0.5 lx, 120ms - wyższa rozdzielczość
 - **L_RES_MODE** (0x13): 4 lx, 16ms - szybszy pomiar
 
 ### Zakres pomiarowy:
+
 - **0 - 65535 lx** (teoretycznie)
 - **Praktycznie:** 1-65535 lx dla H_RES_MODE
 
@@ -322,9 +345,9 @@ int main(void) {
 ## 🎯 Następne kroki
 
 Po zaimplementowaniu podstawowej funkcjonalności możesz:
+
 1. Dodać obsługę różnych trybów pomiaru
 2. Dodać filtrację odczytów (średnia ruchoma)
 3. Zintegrować z protokołem ramkowym (komendy GET_LIGHT, SET_INTERVAL)
 4. Dodać obsługę przerwań I2C
 5. Dodać obsługę wielu czujników (różne adresy)
-

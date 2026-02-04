@@ -1,0 +1,49 @@
+Brak odpowiedzi
+
+Bufor archiwalny odpowiedz -> nie cały bufor a poszczególne indeksy
+Konfigurowanie czujnika bh1170
+Popraw początek ramki -> nie oczekuj na początek ramki, zawsze powinien być początkiem
+
+Frame_idx -> sprawdź dopiero jak się zmieni 
+Dekodowanie nabieraco przed dodaniem do bufora
+Odebrać sprawdzi ze będzie sekwencja kodowa -> później weryfikcajca
+
+Pod jakim adresem jest czujnik -> dane katalogowe
+
+Jak zrobić komunikację z czujnikiem żeby nie było blokowania
+Jak będzie obsługiwana sekwencja 
+
+HAL_I2CTransmit_IT -> skąd wiadomo ze wszystko zostało wysłane po wywylaniu?
+HAL_I2CRecevie_IT
+
+Maszyna stanowa, jak warunek do przejścia do kolejnego stanu
+
+Dokładnie wszystkie komendy i wszystkie odpowiedzi. 
+Pokazać jak wygląda odczyt archiwalny
+
+
+Przyesłyam dane wartość w systemie dzisietnym i nie musze robic kodowania
+parser ramki nie może się konczyc z koncem linii
+
+4bajty w setinterval - binarnie?
+
+opisac crc-8 jaki wariant i jaka wartość początkowa
+
+
+obsługa przy uzyciu nieblokujących:
+maszyna stanow sprawdzający czy mogę wysylac dane za pomocą przerwań czy 
+wysyłka danych trasmit_it -> 
+
+
+
+OBSLUGIWAC BŁĘDY DOPIERO PO ZAKONCZENIU RAMKI
+
+
+dopisać ze parametry sa w taki sposób
+poprawić indeks w buforze przy viewxxzz
+np. 1000 wpisow wyslac
+kolejne kimenda ma mieć kolejen ID przy IDENTYFIAKTORZE RAMKI
+
+
+
+DO POPRAWY JEST KOMENDA 13 
