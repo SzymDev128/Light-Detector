@@ -36,7 +36,7 @@
 // Struktura dla przechowywania pomiarów BH1750
 typedef struct measurement_entry_t {
 	float lux;           // Wartość natężenia światła w luksach
-	uint32_t timestamp;  // Timestamp pomiaru (HAL_GetTick())
+	uint32_t timestamp;  // Timestamp pomiaru (App_GetTick())
 } measurement_entry_t;
 
 /* USER CODE END PTD */
@@ -56,6 +56,8 @@ I2C_HandleTypeDef hi2c1;
 
 UART_HandleTypeDef huart2;
 
+TIM_HandleTypeDef htim2;
+
 /* USER CODE BEGIN PV */
 uint8_t rx_byte;
 
@@ -74,7 +76,6 @@ uint8_t rx_byte;
 static uint8_t bh1750_current_mode = BH1750_CONTINUOUS_HIGH_RES_MODE;
 static uint8_t bh1750_initialized = 0;
 static uint8_t bh1750_addr = BH1750_ADDR_LOW;
-static uint8_t bh1750_addr_tried_high = 0;
 
 typedef enum {
 	BH1750_INIT_IDLE = 0,
@@ -105,6 +106,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 uint8_t is_digits_only(const char *str, uint16_t len);
 void send_response_frame(const char *src_addr, const char *dst_addr, const char *id, const char *data);
@@ -129,7 +131,7 @@ void Measurement_FillTestData(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 #define USART_TXBUF_LEN 1512
-#define USART_RXBUF_LEN 128
+#define USART_RXBUF_LEN 512
 uint8_t USART_TxBuf[USART_TXBUF_LEN];
 uint8_t USART_RxBuf[USART_RXBUF_LEN];
 
@@ -147,13 +149,7 @@ __IO uint8_t USART_RxBufOverflow = 0;
 uint8_t I2C_TxBuf[I2C_TXBUF_LEN];
 uint8_t I2C_RxBuf[I2C_RXBUF_LEN];
 
-__IO int I2C_TX_Empty = 0; // Nadawanie head
-__IO int I2C_TX_Busy = 0;  // Nadawanie tail
-__IO int I2C_RX_Empty = 0; // Odbieranie head
-__IO int I2C_RX_Busy = 0;  // Odbieranie tail
-
 // Sygnalizacja błędów I2C
-__IO uint8_t I2C_RxBufOverflow = 0;
 __IO uint8_t I2C_Error = 0;
 __IO uint8_t I2C_BusReset_Pending = 0;
 
@@ -184,11 +180,43 @@ typedef struct {
 	uint8_t enabled;            // Czy automatyczny odczyt jest włączony
 } measurement_auto_t;
 
+// Struktura dla nieblokującej operacji I2C Bus Recovery
+typedef enum {
+	BUS_RECOVERY_IDLE = 0,
+	BUS_RECOVERY_DISABLE_I2C,
+	BUS_RECOVERY_CONFIG_GPIO,
+	BUS_RECOVERY_PULSE_LOW,
+	BUS_RECOVERY_PULSE_HIGH,
+	BUS_RECOVERY_STOP_SDA_LOW,
+	BUS_RECOVERY_STOP_SCL_HIGH,
+	BUS_RECOVERY_STOP_SDA_HIGH,
+	BUS_RECOVERY_RESTORE_I2C
+} bus_recovery_state_t;
+
+typedef struct {
+	bus_recovery_state_t state;
+	uint8_t pulse_count;
+	uint32_t last_time;
+} bus_recovery_t;
+
 static measurement_auto_t measurement_auto = {
 	.interval_ms = 1000,        // Domyślnie 1 sekunda
 	.last_measurement = 0,
 	.enabled = 0                // Wyłączone domyślnie
 };
+
+static bus_recovery_t bus_recovery = {
+	.state = BUS_RECOVERY_IDLE,
+	.pulse_count = 0,
+	.last_time = 0
+};
+
+// Timer aplikacyjny oparty o TIM2 (1ms)
+static __IO uint32_t app_tick = 0;
+
+static uint32_t App_GetTick(void) {
+	return app_tick;
+}
 
 // Bufor do odczytu BH1750
 static uint8_t bh1750_read_buffer[2] = {0};
@@ -351,10 +379,8 @@ uint8_t I2C_Scan_FirstAddress(uint8_t *found_addr) {
 
 	HAL_I2C_StateTypeDef state = HAL_I2C_GetState(&hi2c1);
 
-	// Upewnij się, że I2C jest gotowe
 	if (state != HAL_I2C_STATE_READY) {
 		HAL_I2C_DeInit(&hi2c1);
-		HAL_Delay(10);
 		if (HAL_I2C_Init(&hi2c1) != HAL_OK) {
 			return 0;
 		}
@@ -419,10 +445,6 @@ uint8_t is_digits_only(const char *str, uint16_t len) {
 
 static uint8_t is_addr_char_valid(char c) {
 	return (c >= 0x21 && c <= 0x7E && c != '&' && c != '*');
-}
-
-static uint8_t is_data_char_valid(char c) {
-	return (c >= 0x20 && c <= 0x7E && c != '&' && c != '*');
 }
 
 // Funkcja do wysyłania ramki odpowiedzi
@@ -502,7 +524,7 @@ uint8_t BH1750_IsTimingReady(void) {
 		return 1; // Nie ma aktywnego oczekiwania
 	}
 	
-	uint32_t current_time = HAL_GetTick();
+	uint32_t current_time = App_GetTick();
 	if ((current_time - bh1750_timing.start_time) >= bh1750_timing.wait_time) {
 		bh1750_timing.active = 0;
 		return 1; // Czas minął
@@ -516,7 +538,7 @@ uint8_t BH1750_IsTimingReady(void) {
  * @param wait_time_ms: Czas oczekiwania w milisekundach
  */
 void BH1750_StartTiming(uint32_t wait_time_ms) {
-	bh1750_timing.start_time = HAL_GetTick();
+	bh1750_timing.start_time = App_GetTick();
 	bh1750_timing.wait_time = wait_time_ms;
 	bh1750_timing.active = 1;
 }
@@ -536,16 +558,10 @@ void BH1750_Init_Process(void) {
 		return;
 	}
 
-	// Jeśli był błąd I2C, spróbuj drugim adresem
+	// Jeśli był błąd I2C, zresetuj stan inicjalizacji
 	if (I2C_Error) {
 		I2C_Error = 0;
 		bh1750_initialized = 0;
-		if (!bh1750_addr_tried_high) {
-			bh1750_addr = BH1750_ADDR_HIGH;
-			bh1750_addr_tried_high = 1;
-		} else {
-			bh1750_addr = BH1750_ADDR_LOW;
-		}
 		bh1750_init_state = BH1750_INIT_IDLE;
 		return;
 	}
@@ -557,7 +573,7 @@ void BH1750_Init_Process(void) {
 	
 	// Throttling - nie próbuj zbyt często (1 sekunda między próbami)
 	if (bh1750_init_state == BH1750_INIT_IDLE) {
-		uint32_t now = HAL_GetTick();
+		uint32_t now = App_GetTick();
 		if (now - last_retry_time < 1000) {
 			return; // Czekaj
 		}
@@ -612,7 +628,7 @@ HAL_StatusTypeDef BH1750_SetMode(uint8_t mode) {
 	if (status == HAL_OK) {
 		bh1750_current_mode = mode;
 		
-		// Rozpoczęcie śledzenia czasu oczekiwania (bez HAL_Delay!)
+		// Rozpoczęcie śledzenia czasu oczekiwania
 		// Opóźnienie w zależności od trybu (120ms dla high res, 16ms dla low res)
 		if (mode == BH1750_CONTINUOUS_LOW_RES_MODE || mode == BH1750_ONETIME_LOW_RES_MODE) {
 			BH1750_StartTiming(16);
@@ -631,7 +647,7 @@ HAL_StatusTypeDef BH1750_SetMode(uint8_t mode) {
 void Measurement_AddEntry(float lux) {
 	// Zapisanie pomiaru do bufora
 	measurement_buffer[measurement_write_index].lux = lux;
-	measurement_buffer[measurement_write_index].timestamp = HAL_GetTick();
+	measurement_buffer[measurement_write_index].timestamp = App_GetTick();
 	
 	// Aktualizacja indeksu (bufor cykliczny)
 	measurement_write_index++;
@@ -729,7 +745,7 @@ void Measurement_SetInterval(uint32_t interval_ms) {
 void Measurement_EnableAutoRead(uint8_t enable) {
 	measurement_auto.enabled = enable;
 	if (enable) {
-		measurement_auto.last_measurement = HAL_GetTick();
+		measurement_auto.last_measurement = App_GetTick();
 	}
 }
 
@@ -752,7 +768,7 @@ void Measurement_AutoRead_Process(void) {
 	}
 
 	// Sprawdzenie czy minął interwał
-	uint32_t current_time = HAL_GetTick();
+	uint32_t current_time = App_GetTick();
 	if ((current_time - measurement_auto.last_measurement) >= measurement_auto.interval_ms) {
 		measurement_auto.last_measurement = current_time; // Zaktualizuj czas
 		
@@ -779,7 +795,7 @@ void handle_command(char *cmd, const char *src_addr, const char *dst_addr, const
 	
 	// Sprawdzenie minimalnej długości (kod komendy = 2 cyfry)
 	if (strlen(cmd) < 2 || !is_digits_only(cmd, 2)) {
-		send_response_frame(device_addr, src_addr, id, "01"); // ERR_PARAM
+		USART_fsend("ERR: INVALID CMD\r\n");
 		return;
 	}
 	
@@ -823,7 +839,7 @@ void handle_command(char *cmd, const char *src_addr, const char *dst_addr, const
 	}
 	// 13 - VIEW (+ xxzz parametry)
 	else if (cmd_code == 13) {
-		if (strlen(params) < 4 || !is_digits_only(params, 4)) {
+		if (strlen(params) < 4) {
 			send_response_frame(device_addr, src_addr, id, "01"); // ERR_PARAM
 			return;
 		}
@@ -890,7 +906,7 @@ void handle_command(char *cmd, const char *src_addr, const char *dst_addr, const
 	}
 	// 14 - SET_INTERVAL (+ xxxx parametr)
 	else if (cmd_code == 14) {
-		if (strlen(params) < 4 || !is_digits_only(params, 4)) {
+		if (strlen(params) < 4) {
 			send_response_frame(device_addr, src_addr, id, "01"); // ERR_PARAM
 			return;
 		}
@@ -978,7 +994,7 @@ void handle_command(char *cmd, const char *src_addr, const char *dst_addr, const
 	}
 	// Nieznany kod komendy
 	else {
-		send_response_frame(device_addr, src_addr, id, "01"); // ERR_PARAM
+		USART_fsend("ERR: UNKNOWN CMD\r\n");
 	}
 }
 
@@ -990,38 +1006,24 @@ void validate_frame(char *f, uint16_t flen)
 	/* Minimalna ramka: & SRC(3) DST(3) ID(2) LEN(3) CRC(2) * = 13 znaków */
 	if(flen < 13)
 	{
-		// Nie możemy wysłać odpowiedzi, bo nie mamy pełnych danych ramki
+		// Ramka zbyt krótka - błąd strukturalny
 		USART_fsend("ERR: TOO SHORT\r\n");
-		return;
-	}
-
-	/* ====== Sprawdzenie granic ramki ====== */
-	if(f[0] != '&' || f[flen-1] != '*')
-	{
-		// Nie możemy wysłać odpowiedzi, bo nie mamy pełnych danych ramki
-		USART_fsend("ERR: BAD BOUNDARY\r\n");
 		return;
 	}
 
 	/* ====== Parsowanie pól ====== */
 	uint16_t pos = 1;  // po '&'
 
-	// Sprawdzenie czy mamy wystarczająco danych do parsowania podstawowych pól
-	if(flen < 12) // & + SRC(3) + DST(3) + ID(2) + LEN(3) = 12
-	{
-		USART_fsend("ERR: TOO SHORT\r\n");
-		return;
-	}
-
 	memcpy(src, &f[pos], 3); src[3]=0; pos+=3;
 	memcpy(dst, &f[pos], 3); dst[3]=0; pos+=3;
 	memcpy(id,  &f[pos], 2); id[2]=0;  pos+=2;
 	memcpy(len_str, &f[pos], 3); len_str[3]=0; pos+=3;
-	const char *device_addr = dst;
 
 	/* ====== Walidacja znaków SRC/DST ====== */
 	for (uint8_t i = 0; i < 3; i++) {
 		if (!is_addr_char_valid(src[i]) || !is_addr_char_valid(dst[i])) {
+			// Nieprawidłowe znaki w adresach - błąd strukturalny
+			USART_fsend("ERR: INVALID ADDR\r\n");
 			return;
 		}
 	}
@@ -1029,14 +1031,16 @@ void validate_frame(char *f, uint16_t flen)
 	/* ====== Sprawdzenie formatu ID (tylko cyfry 0-9) ====== */
 	if(!is_digits_only(id, 2))
 	{
-		send_response_frame(device_addr, src, id, "ERR");
+		// Nieprawidłowe znaki w ID - błąd strukturalny
+		USART_fsend("ERR: INVALID ID\r\n");
 		return;
 	}
 
 	/* ====== Sprawdzenie formatu długości (tylko cyfry 0-9) ====== */
 	if(!is_digits_only(len_str, 3))
 	{
-		send_response_frame(device_addr, src, id, "ERR");
+		// Nieprawidłowe znaki w LEN - błąd strukturalny
+		USART_fsend("ERR\r\n");
 		return;
 	}
 
@@ -1045,7 +1049,8 @@ void validate_frame(char *f, uint16_t flen)
 	/* ====== Sprawdzenie maksymalnej długości ====== */
 	if(data_len_declared > 256)
 	{
-		send_response_frame(device_addr, src, id, "ERR_LENGTH");
+		// Długość > 256 - błąd strukturalny
+		USART_fsend("ERR_LENGTH\r\n");
 		return;
 	}
 
@@ -1056,7 +1061,8 @@ void validate_frame(char *f, uint16_t flen)
 	// Minimalna długość: & + SRC(3) + DST(3) + ID(2) + LEN(3) + DATA + CRC(2) + * = 14 + DATA
 	if(flen < (data_start + data_len_declared + 3)) // data_start + data_len + CRC(2) + '*'(1)
 	{
-		send_response_frame(device_addr, src, id, "ERR_LENGTH");
+		// Niezgodność długości - błąd strukturalny
+		USART_fsend("ERR_LENGTH\r\n");
 		return;
 	}
 	
@@ -1069,18 +1075,18 @@ void validate_frame(char *f, uint16_t flen)
 	memcpy(data, &f[data_start], data_len_real);
 	data[data_len_real] = 0;
 
-	/* ====== Walidacja znaków DATA ====== */
-	for (uint16_t i = 0; i < data_len_real; i++) {
-		if (!is_data_char_valid(data[i])) {
-			send_response_frame(device_addr, src, id, "ERR");
-			return;
-		}
+	/* ====== Walidacja znaków DATA (tylko cyfry 0-9) ====== */
+	if (!is_digits_only(data, data_len_real)) {
+		// Nieprawidłowe znaki w DATA - błąd strukturalny
+		USART_fsend("ERR\r\n");
+		return;
 	}
 
 	/* ====== Sprawdzenie czy mamy CRC ====== */
 	if(flen < (crc_pos + 2))
 	{
-		send_response_frame(device_addr, src, id, "ERR");
+		// Brak pola CRC - błąd strukturalny
+		USART_fsend("ERR\r\n");
 		return;
 	}
 
@@ -1104,7 +1110,8 @@ void validate_frame(char *f, uint16_t flen)
 	/* ====== Sprawdzenie CRC ====== */
 	if(calc_crc != rx_crc)
 	{
-		send_response_frame(device_addr, src, id, "ERR_CRC");
+		// Błędne CRC - błąd strukturalny
+		USART_fsend("ERR_CRC\r\n");
 		return;
 	}
 	
@@ -1158,10 +1165,6 @@ void process_uart_buffer(void)
 
 /* USER CODE END 0 */
 
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
 int main(void)
 {
 
@@ -1189,7 +1192,9 @@ int main(void)
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   MX_I2C1_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
+	HAL_TIM_Base_Start_IT(&htim2);
 	// Inicjalizacja BH1750 wykonywana bez blokowania w pętli głównej
 	USART_fsend("\r\nSYSTEM START\r\n");
 	// Tymczasowe dane testowe do sprawdzenia komend (stałe wartości)
@@ -1209,19 +1214,12 @@ int main(void)
 		I2C_BusRecovery_Process();
 		process_uart_buffer();
 		BH1750_Init_Process();
-		Measurement_AutoRead_Process(); // Automatyczny odczyt pomiarów co interwał
+		Measurement_AutoRead_Process(); 
 
-//    	while(USART_kbhit()) {
-//			int16_t ch = USART_getchar();
-//			if(ch != -1) {
-//				process_uart_char((char)ch, USART_RX_Busy, USART_RxBuf);
-//			}
-//		}
-//
-//		if(USART_RxBufOverflow) {
-//			USART_fsend("\r\nERROR: USART RX buffer overflow!\r\n");
-//			USART_RxBufOverflow = 0;
-//		}
+		if(USART_RxBufOverflow) {
+			USART_fsend("\r\nERROR: USART RX buffer overflow!\r\n");
+			USART_RxBufOverflow = 0;
+		}
 	}
 
   /* USER CODE END 3 */
@@ -1316,6 +1314,51 @@ static void MX_I2C1_Init(void)
 }
 
 /**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 8999;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 9;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+
+}
+
+/**
   * @brief USART2 Initialization Function
   * @param None
   * @retval None
@@ -1389,6 +1432,12 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+	if (htim->Instance == TIM2) {
+		app_tick++;
+	}
+}
+
 // Callbacki I2C
 void HAL_I2C_MasterTxCpltCallback(I2C_HandleTypeDef *hi2c) {
 	if (hi2c == &hi2c1) {
@@ -1426,50 +1475,147 @@ void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c) {
 	}
 }
 
+/**
+ * @brief Nieblokujące odzyskiwanie zablokowanej magistrali I2C (Bus Recovery)
+ * 
+ * Funkcja implementuje procedurę odzyskiwania magistrali I2C zgodnie ze standardem I2C.
+ * Wykorzystuje maszynę stanów do wykonania recovery bez blokowania głównej pętli programu.
+ * 
+ * PROBLEM:
+ * Gdy urządzenie I2C (BH1750) zawiesi się i trzyma linię SDA na LOW, magistrala jest
+ * zablokowana i STM32 nie może komunikować się z czujnikiem.
+ * 
+ * ROZWIĄZANIE:
+ * 1. Wyłączenie peryferii I2C STM32
+ * 2. Rekonfiguracja pinów jako GPIO (Open-Drain)
+ * 3. Wygenerowanie 9 pulsów zegarowych (SCL) - wymusza slave do zakończenia operacji
+ * 4. Wygenerowanie STOP condition (SDA: LOW→HIGH gdy SCL=HIGH)
+ * 5. Przywrócenie konfiguracji I2C
+ * 
+ * TIMING:
+ * - Każdy krok czeka 1ms (używa App_GetTick() z TIM2)
+ * - Całość trwa ~23ms bez blokowania CPU
+ * - Throttling: maksymalnie 1 recovery na 100ms
+ * 
+ * WYWOŁANIE:
+ * Automatyczne uruchomienie gdy HAL_I2C_ErrorCallback() ustawi flagę I2C_BusReset_Pending
+ * 
+ * @note Funkcja wywoływana cyklicznie w pętli głównej
+ */
 void I2C_BusRecovery_Process(void) {
 	static uint32_t last_reset = 0;
+	uint32_t now = App_GetTick();
 
-	if (!I2C_BusReset_Pending) {
-		return;
+	// Sprawdź czy recovery jest wymagany
+	if (!I2C_BusReset_Pending && bus_recovery.state == BUS_RECOVERY_IDLE) {
+		return; // Brak błędu I2C - nic do roboty
 	}
 
-	uint32_t now = HAL_GetTick();
-	if (now - last_reset < 100) {
-		return;
-	}
-	last_reset = now;
-	I2C_BusReset_Pending = 0;
-
-	// 1. Wyłącz I2C
-	__HAL_I2C_DISABLE(&hi2c1);
-
-	// 2. Skonfiguruj piny jako GPIO
-	GPIO_InitTypeDef GPIO_InitStruct = {0};
-	GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7; // PB6=SCL, PB7=SDA
-	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
-	GPIO_InitStruct.Pull = GPIO_PULLUP;
-	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-	HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-	// 3. Wygeneruj 9 pulsów zegarowych żeby uwolnić SDA
-	for (int i = 0; i < 9; i++) {
-		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET); // SCL LOW
-		HAL_Delay(1);
-		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);   // SCL HIGH
-		HAL_Delay(1);
+	// Throttling - rozpocznij recovery tylko raz na 100ms (zabezpieczenie przed zapętleniem)
+	if (I2C_BusReset_Pending && bus_recovery.state == BUS_RECOVERY_IDLE) {
+		if (now - last_reset < 100) {
+			return; // Czekaj minimalnie 100ms między próbami recovery
+		}
+		last_reset = now;
+		I2C_BusReset_Pending = 0;
+		bus_recovery.state = BUS_RECOVERY_DISABLE_I2C;
+		bus_recovery.pulse_count = 0;
+		bus_recovery.last_time = now;
 	}
 
-	// 4. Wygeneruj STOP condition
-	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET); // SDA LOW
-	HAL_Delay(1);
-	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);   // SCL HIGH
-	HAL_Delay(1);
-	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET);   // SDA HIGH
-	HAL_Delay(1);
+	// Maszyna stanów dla nieblokującego recovery (każdy krok co 1ms)
+	switch (bus_recovery.state) {
+		case BUS_RECOVERY_IDLE:
+			// Stan bezczynności - czekanie na błąd I2C
+			break;
 
-	// 5. Przywróć konfigurację I2C
-	HAL_I2C_DeInit(&hi2c1);
-	HAL_I2C_Init(&hi2c1);
+		case BUS_RECOVERY_DISABLE_I2C:
+			// Krok 1: Wyłączenie peryferii I2C STM32
+			__HAL_I2C_DISABLE(&hi2c1);
+			bus_recovery.state = BUS_RECOVERY_CONFIG_GPIO;
+			break;
+
+		case BUS_RECOVERY_CONFIG_GPIO: {
+			// Krok 2: Rekonfiguracja pinów I2C jako GPIO (Open-Drain z pull-up)
+			GPIO_InitTypeDef GPIO_InitStruct = {0};
+			GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7; // PB6=SCL, PB7=SDA
+			GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;     // Open-Drain (jak I2C)
+			GPIO_InitStruct.Pull = GPIO_PULLUP;             // Pull-up
+			GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+			HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+			bus_recovery.pulse_count = 0;
+			bus_recovery.last_time = now;
+			bus_recovery.state = BUS_RECOVERY_PULSE_LOW;
+			break;
+		}
+
+		case BUS_RECOVERY_PULSE_LOW:
+			// Krok 3a: Generowanie pulsów zegarowych - faza LOW (czekaj 1ms)
+			if (now - bus_recovery.last_time >= 1) {
+				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET); // SCL LOW
+				bus_recovery.last_time = now;
+				bus_recovery.state = BUS_RECOVERY_PULSE_HIGH;
+			}
+			break;
+
+		case BUS_RECOVERY_PULSE_HIGH:
+			// Krok 3b: Generowanie pulsów zegarowych - faza HIGH (czekaj 1ms)
+			// Powtarzamy 9 razy aby slave mógł zakończyć przerwane wysyłanie
+			if (now - bus_recovery.last_time >= 1) {
+				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);   // SCL HIGH
+				bus_recovery.last_time = now;
+				bus_recovery.pulse_count++;
+				if (bus_recovery.pulse_count >= 9) {
+					// 9 pulsów zakończone - przejdź do generowania STOP condition
+					bus_recovery.state = BUS_RECOVERY_STOP_SDA_LOW;
+				} else {
+					// Kolejny puls
+					bus_recovery.state = BUS_RECOVERY_PULSE_LOW;
+				}
+			}
+			break;
+
+		case BUS_RECOVERY_STOP_SDA_LOW:
+			// Krok 4a: STOP condition - ustaw SDA na LOW (czekaj 1ms)
+			if (now - bus_recovery.last_time >= 1) {
+				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET); // SDA LOW
+				bus_recovery.last_time = now;
+				bus_recovery.state = BUS_RECOVERY_STOP_SCL_HIGH;
+			}
+			break;
+
+		case BUS_RECOVERY_STOP_SCL_HIGH:
+			// Krok 4b: STOP condition - ustaw SCL na HIGH (czekaj 1ms)
+			if (now - bus_recovery.last_time >= 1) {
+				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);   // SCL HIGH
+				bus_recovery.last_time = now;
+				bus_recovery.state = BUS_RECOVERY_STOP_SDA_HIGH;
+			}
+			break;
+
+		case BUS_RECOVERY_STOP_SDA_HIGH:
+			// Krok 4c: STOP condition - ustaw SDA na HIGH (przejście LOW→HIGH = STOP)
+			if (now - bus_recovery.last_time >= 1) {
+				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);   // SDA HIGH
+				bus_recovery.last_time = now;
+				bus_recovery.state = BUS_RECOVERY_RESTORE_I2C;
+			}
+			break;
+
+		case BUS_RECOVERY_RESTORE_I2C:
+			// Krok 5: Przywrócenie konfiguracji I2C i powrót do normalnej pracy
+			if (now - bus_recovery.last_time >= 1) {
+				HAL_I2C_DeInit(&hi2c1);  // Deinicjalizacja I2C
+				HAL_I2C_Init(&hi2c1);    // Reinicjalizacja I2C (piny wrócą do funkcji AF)
+				bus_recovery.state = BUS_RECOVERY_IDLE; // Gotowe - czekaj na kolejny błąd
+			}
+			break;
+
+		default:
+			// Zabezpieczenie - nieprawidłowy stan
+			bus_recovery.state = BUS_RECOVERY_IDLE;
+			break;
+	}
 }
 
 /* USER CODE END 4 */
