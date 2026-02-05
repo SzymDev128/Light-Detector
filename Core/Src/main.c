@@ -400,7 +400,6 @@ uint8_t I2C_Scan_FirstAddress(uint8_t *found_addr) {
 	return 0;
 }
 
-
 // Konwersja dwóch znaków hex na bajt
 uint8_t hex2byte(char hi, char lo) {
 	uint8_t high = (hi >= '0' && hi <= '9') ? hi - '0' :
@@ -412,6 +411,7 @@ uint8_t hex2byte(char hi, char lo) {
 	return (high << 4) | low;
 }
 
+// Obliczanie CRC-8 (polinom 0x07)
 uint8_t crc8(uint8_t *data, uint16_t len) {
 	uint8_t crc = 0x00;
 	for (uint16_t i = 0; i < len; i++) {
@@ -614,7 +614,7 @@ void BH1750_Init_Process(void) {
 }
 
 /**
- * @brief Ustawienie trybu pracy czujnika BH1750 (przez przerwania, bez HAL_Delay)
+ * @brief Ustawienie trybu pracy czujnika BH1750 (przez przerwania)
  * @param mode: Tryb pracy (jedna z komend BH1750: 0x10, 0x11, 0x13, 0x20, 0x21, 0x23)
  * @retval HAL_StatusTypeDef
  */
@@ -663,13 +663,19 @@ void Measurement_AddEntry(float lux) {
 
 // Tymczasowe wypełnienie bufora pomiarów danymi testowymi (stałe wartości)
 void Measurement_FillTestData(void) {
-	static const float test_values[] = {
-		10.0f, 100.0f, 250.0f, 500.0f, 750.0f,
-		1000.0f, 1500.0f, 2000.0f, 3500.0f, 5000.0f
-	};
-	for (uint16_t i = 0; i < (uint16_t)(sizeof(test_values) / sizeof(test_values[0])); i++) {
-		Measurement_AddEntry(test_values[i]);
+	// Dodajemy 2500 pomiarów, żeby przetestować bufor cykliczny
+	// Bufor ma 1000 miejsc, więc pierwsze 1500 zostanie nadpisanych
+	// Zostanie nam 1000 najnowszych pomiarów (od #1501 do #2500)
+	for (uint16_t i = 1; i <= 2500; i++) {
+		// Każdy pomiar ma wartość bazową + numer (np. 100.0 + 1 = 101.0)
+		float lux_value = 100.0f + (float)i;
+		Measurement_AddEntry(lux_value);
 	}
+	// Po tej operacji:
+	// - measurement_count = 1000 (bufor pełny)
+	// - measurement_write_index = 500 (bo 2500 % 1000 = 500)
+	// - Najstarszy pomiar (indeks logiczny 0) będzie pomiar #1501 (wartość 1601.0) na fizycznym indeksie 500
+	// - Najnowszy pomiar (indeks logiczny 999) będzie pomiar #2500 (wartość 2600.0) na fizycznym indeksie 499
 }
 
 /**
