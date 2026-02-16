@@ -56,7 +56,7 @@ I2C_HandleTypeDef hi2c1;
 
 UART_HandleTypeDef huart2;
 
-TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim3;
 
 /* USER CODE BEGIN PV */
 uint8_t rx_byte;
@@ -106,7 +106,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_I2C1_Init(void);
-static void MX_TIM2_Init(void);
+static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
 uint8_t is_digits_only(const char *str, uint16_t len);
 void send_response_frame(const char *src_addr, const char *dst_addr, const char *id, const char *data);
@@ -123,7 +123,6 @@ HAL_StatusTypeDef BH1750_ReadLight(float *lux);
 void Measurement_AutoRead_Process(void);
 void Measurement_SetInterval(uint32_t interval_ms);
 void Measurement_EnableAutoRead(uint8_t enable);
-uint8_t I2C_Scan_FirstAddress(uint8_t *found_addr);
 void Measurement_FillTestData(void);
 /* USER CODE END PFP */
 
@@ -178,14 +177,13 @@ typedef struct {
 	uint8_t enabled;            // Czy automatyczny odczyt jest włączony
 } measurement_auto_t;
 
-
 static measurement_auto_t measurement_auto = {
 	.interval_ms = 1000,        // Domyślnie 1 sekunda
 	.last_measurement = 0,
 	.enabled = 0                // Wyłączone domyślnie
 };
 
-// Timer aplikacyjny oparty o TIM2 (1ms)
+// Timer aplikacyjny oparty o tim3 (1ms)
 static __IO uint32_t app_tick = 0;
 
 static uint32_t App_GetTick(void) {
@@ -344,36 +342,11 @@ HAL_StatusTypeDef I2C_Receive_IT(uint8_t address, uint8_t *data, uint16_t len) {
 	return status;
 }
 
-// Prosty skan I2C - zwraca pierwszy znaleziony adres (7-bit)
-uint8_t I2C_Scan_FirstAddress(uint8_t *found_addr) {
-	if (!found_addr) {
-		return 0;
-	}
-	*found_addr = 0;
-
-	HAL_I2C_StateTypeDef state = HAL_I2C_GetState(&hi2c1);
-
-	if (state != HAL_I2C_STATE_READY) {
-		HAL_I2C_DeInit(&hi2c1);
-		if (HAL_I2C_Init(&hi2c1) != HAL_OK) {
-			return 0;
-		}
-	}
-
-	uint8_t test_addrs[] = {0x23, 0x5C}; // BH1750 adresy
-	for (uint8_t i = 0; i < 2; i++) {
-		uint8_t addr = test_addrs[i];
-		HAL_StatusTypeDef result = HAL_I2C_IsDeviceReady(&hi2c1, addr << 1, 3, 100);
-		
-		if (result == HAL_OK) {
-			*found_addr = addr;
-			return 1;
-		}
-	}
-
-	return 0;
+// Sprawdzenie czy znak jest prawidłowym znakiem hex (0-9, A-F, a-f)
+static uint8_t is_hex_char(char c) {
+	return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
 }
-// poprawic przykład dla X i Y
+
 // Konwersja dwóch znaków hex na bajt
 uint8_t hex2byte(char hi, char lo) {
 	uint8_t high = (hi >= '0' && hi <= '9') ? hi - '0' :
@@ -955,23 +928,6 @@ void handle_command(char *cmd, const char *src_addr, const char *dst_addr, const
 		response[1] = 0;
 		send_response_frame(device_addr, src_addr, id, response);
 	}
-	// 18 - I2C_SCAN (zwraca pierwszy znaleziony adres)
-	else if (cmd_code == 18) {
-		uint8_t found_addr = 0;
-		char response[5];
-		if (I2C_Scan_FirstAddress(&found_addr)) {
-			// Odpowiedź: hex adresu (2 znaki)
-			byte2hex(found_addr, &response[0]);
-			response[2] = 0;
-			send_response_frame(device_addr, src_addr, id, response);
-		} else {
-			// Brak urządzeń - wysyłamy "00"
-			response[0] = '0';
-			response[1] = '0';
-			response[2] = 0;
-			send_response_frame(device_addr, src_addr, id, response);
-		}
-	}
 	// Nieznany kod komendy
 	else {
 		USART_fsend("ERR: UNKNOWN CMD\r\n");
@@ -1067,6 +1023,13 @@ void validate_frame(char *f, uint16_t flen)
 	if(flen < (crc_pos + 2))
 	{
 		// Brak pola CRC - błąd strukturalny
+		USART_fsend("ERR\r\n");
+		return;
+	}
+
+	/* ====== Walidacja znaków CRC (muszą być hex) ====== */
+	if (!is_hex_char(f[crc_pos]) || !is_hex_char(f[crc_pos+1])) {
+		// Nieprawidłowe znaki w CRC - błąd strukturalny
 		USART_fsend("ERR\r\n");
 		return;
 	}
@@ -1173,9 +1136,9 @@ int main(void)
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   MX_I2C1_Init();
-  MX_TIM2_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-	HAL_TIM_Base_Start_IT(&htim2);
+	HAL_TIM_Base_Start_IT(&htim3);
 	// Inicjalizacja BH1750 wykonywana bez blokowania w pętli głównej
 	USART_fsend("\r\nSYSTEM START\r\n");
 	// Tymczasowe dane testowe do sprawdzenia komend (stałe wartości)
@@ -1272,7 +1235,7 @@ static void MX_I2C1_Init(void)
   /* USER CODE END I2C1_Init 0 */
 
   /* USER CODE BEGIN I2C1_Init 1 */
-
+	
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
   hi2c1.Init.ClockSpeed = 100000;
@@ -1294,47 +1257,47 @@ static void MX_I2C1_Init(void)
 }
 
 /**
-  * @brief TIM2 Initialization Function
+  * @brief TIM3 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_TIM2_Init(void)
+static void MX_TIM3_Init(void)
 {
 
-  /* USER CODE BEGIN TIM2_Init 0 */
+  /* USER CODE BEGIN TIM3_Init 0 */
 
-  /* USER CODE END TIM2_Init 0 */
+  /* USER CODE END TIM3_Init 0 */
 
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
 
-  /* USER CODE BEGIN TIM2_Init 1 */
+  /* USER CODE BEGIN TIM3_Init 1 */
 
-  /* USER CODE END TIM2_Init 1 */
-  htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 8999;
-  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 9;
-  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 8999;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 9;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
   {
     Error_Handler();
   }
   sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
   {
     Error_Handler();
   }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN TIM2_Init 2 */
+  /* USER CODE BEGIN TIM3_Init 2 */
 
-  /* USER CODE END TIM2_Init 2 */
+  /* USER CODE END TIM3_Init 2 */
 
 }
 
@@ -1413,7 +1376,7 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-	if (htim->Instance == TIM2) {
+	if (htim->Instance == TIM3) {
 		app_tick++;
 	}
 }
@@ -1440,9 +1403,9 @@ void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c) {
 				uint16_t raw_value = (bh1750_read_buffer[0] << 8) | bh1750_read_buffer[1];
 				// Dynamiczne przeliczanie na luksy w zależności od trybu
 				float lux_divider = 1.2f; // domyślnie H-Resolution Mode
-				if (bh1750_mode == 0x11) { // H-Resolution Mode2
+				if (bh1750_current_mode == 0x11) { // H-Resolution Mode2
 					lux_divider = 2.4f;
-				} else if (bh1750_mode == 0x13) { // L-Resolution Mode
+				} else if (bh1750_current_mode == 0x13) { // L-Resolution Mode
 					lux_divider = 0.5f;
 				}
 				bh1750_last_lux = raw_value / lux_divider;
