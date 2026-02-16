@@ -116,7 +116,6 @@ HAL_StatusTypeDef I2C_Receive_IT(uint8_t address, uint8_t *data, uint16_t len);
 uint8_t BH1750_IsTimingReady(void);
 void BH1750_StartTiming(uint32_t wait_time_ms);
 void BH1750_Init_Process(void);
-void I2C_BusRecovery_Process(void);
 void Measurement_AddEntry(float lux);
 uint16_t Measurement_GetCount(void);
 measurement_entry_t* Measurement_GetEntry(uint16_t index);
@@ -144,14 +143,13 @@ __IO int USART_RX_Busy = 0;  // Odbieranie tail
 __IO uint8_t USART_RxBufOverflow = 0;
 
 // I2C Circular Buffers
-#define I2C_TXBUF_LEN 256
-#define I2C_RXBUF_LEN 256
+#define I2C_TXBUF_LEN 512
+#define I2C_RXBUF_LEN 512
 uint8_t I2C_TxBuf[I2C_TXBUF_LEN];
 uint8_t I2C_RxBuf[I2C_RXBUF_LEN];
 
 // Sygnalizacja błędów I2C
 __IO uint8_t I2C_Error = 0;
-__IO uint8_t I2C_BusReset_Pending = 0;
 
 // Struktura dla operacji I2C
 typedef struct {
@@ -180,35 +178,11 @@ typedef struct {
 	uint8_t enabled;            // Czy automatyczny odczyt jest włączony
 } measurement_auto_t;
 
-// Struktura dla nieblokującej operacji I2C Bus Recovery
-typedef enum {
-	BUS_RECOVERY_IDLE = 0,
-	BUS_RECOVERY_DISABLE_I2C,
-	BUS_RECOVERY_CONFIG_GPIO,
-	BUS_RECOVERY_PULSE_LOW,
-	BUS_RECOVERY_PULSE_HIGH,
-	BUS_RECOVERY_STOP_SDA_LOW,
-	BUS_RECOVERY_STOP_SCL_HIGH,
-	BUS_RECOVERY_STOP_SDA_HIGH,
-	BUS_RECOVERY_RESTORE_I2C
-} bus_recovery_state_t;
-
-typedef struct {
-	bus_recovery_state_t state;
-	uint8_t pulse_count;
-	uint32_t last_time;
-} bus_recovery_t;
 
 static measurement_auto_t measurement_auto = {
 	.interval_ms = 1000,        // Domyślnie 1 sekunda
 	.last_measurement = 0,
 	.enabled = 0                // Wyłączone domyślnie
-};
-
-static bus_recovery_t bus_recovery = {
-	.state = BUS_RECOVERY_IDLE,
-	.pulse_count = 0,
-	.last_time = 0
 };
 
 // Timer aplikacyjny oparty o TIM2 (1ms)
@@ -399,7 +373,7 @@ uint8_t I2C_Scan_FirstAddress(uint8_t *found_addr) {
 
 	return 0;
 }
-
+// poprawic przykład dla X i Y
 // Konwersja dwóch znaków hex na bajt
 uint8_t hex2byte(char hi, char lo) {
 	uint8_t high = (hi >= '0' && hi <= '9') ? hi - '0' :
@@ -1062,6 +1036,7 @@ void validate_frame(char *f, uint16_t flen)
 
 	/* ====== Sprawdzenie faktycznej długości danych ====== */
 	uint16_t data_start = pos;
+	// poprawic
 	
 	// Sprawdzenie czy ramka jest wystarczająco długa dla deklarowanej długości danych
 	// Minimalna długość: & + SRC(3) + DST(3) + ID(2) + LEN(3) + DATA + CRC(2) + * = 14 + DATA
@@ -1097,7 +1072,7 @@ void validate_frame(char *f, uint16_t flen)
 	}
 
 	/* ====== Odczyt i weryfikacja CRC ====== */
-	uint8_t rx_crc = hex2byte(f[crc_pos], f[crc_pos+1]);
+	uint8_t rx_crc = hex2byte(f[crc_pos], f[crc_pos+1]); // nie mozna tak
 
 	/* ====== Budowa bufora do obliczenia CRC ====== */
 	/* Maksymalny rozmiar: src(3) + dst(3) + id(2) + len(3) + data(256) = 267 bajtów */
@@ -1135,7 +1110,7 @@ void process_uart_buffer(void)
         switch(st)
         {
         case ST_IDLE:
-            if(c == '&')
+            if(c == '&') // poprawic nie moze sprawdzac czy jest (pos moze)
             {
                 pos = 0;
                 frame[pos++] = c;
@@ -1217,7 +1192,6 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-		I2C_BusRecovery_Process();
 		process_uart_buffer();
 		BH1750_Init_Process();
 		Measurement_AutoRead_Process(); 
@@ -1464,8 +1438,14 @@ void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c) {
 			if (i2c_op.len == 2 && i2c_op.data == bh1750_read_buffer) {
 				// Konwersja bajtów na 16-bitową wartość (big-endian)
 				uint16_t raw_value = (bh1750_read_buffer[0] << 8) | bh1750_read_buffer[1];
-				// Przeliczenie na luksy: wartość / 1.2 (dla trybu H_RES_MODE)
-				bh1750_last_lux = raw_value / 1.2f;
+				// Dynamiczne przeliczanie na luksy w zależności od trybu
+				float lux_divider = 1.2f; // domyślnie H-Resolution Mode
+				if (bh1750_mode == 0x11) { // H-Resolution Mode2
+					lux_divider = 2.4f;
+				} else if (bh1750_mode == 0x13) { // L-Resolution Mode
+					lux_divider = 0.5f;
+				}
+				bh1750_last_lux = raw_value / lux_divider;
 				bh1750_read_ready = 1;
 			}
 		}
@@ -1477,150 +1457,6 @@ void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c) {
 	if (hi2c == &hi2c1) {
 		I2C_Error = 1;
 		i2c_op.pending = 0;
-		I2C_BusReset_Pending = 1;
-	}
-}
-
-/**
- * @brief Nieblokujące odzyskiwanie zablokowanej magistrali I2C (Bus Recovery)
- * 
- * Funkcja implementuje procedurę odzyskiwania magistrali I2C zgodnie ze standardem I2C.
- * Wykorzystuje maszynę stanów do wykonania recovery bez blokowania głównej pętli programu.
- * 
- * PROBLEM:
- * Gdy urządzenie I2C (BH1750) zawiesi się i trzyma linię SDA na LOW, magistrala jest
- * zablokowana i STM32 nie może komunikować się z czujnikiem.
- * 
- * ROZWIĄZANIE:
- * 1. Wyłączenie peryferii I2C STM32
- * 2. Rekonfiguracja pinów jako GPIO (Open-Drain)
- * 3. Wygenerowanie 9 pulsów zegarowych (SCL) - wymusza slave do zakończenia operacji
- * 4. Wygenerowanie STOP condition (SDA: LOW→HIGH gdy SCL=HIGH)
- * 5. Przywrócenie konfiguracji I2C
- * 
- * TIMING:
- * - Każdy krok czeka 1ms (używa App_GetTick() z TIM2)
- * - Całość trwa ~23ms bez blokowania CPU
- * - Throttling: maksymalnie 1 recovery na 100ms
- * 
- * WYWOŁANIE:
- * Automatyczne uruchomienie gdy HAL_I2C_ErrorCallback() ustawi flagę I2C_BusReset_Pending
- * 
- * @note Funkcja wywoływana cyklicznie w pętli głównej
- */
-void I2C_BusRecovery_Process(void) {
-	static uint32_t last_reset = 0;
-	uint32_t now = App_GetTick();
-
-	// Sprawdź czy recovery jest wymagany
-	if (!I2C_BusReset_Pending && bus_recovery.state == BUS_RECOVERY_IDLE) {
-		return; // Brak błędu I2C - nic do roboty
-	}
-
-	// Throttling - rozpocznij recovery tylko raz na 100ms (zabezpieczenie przed zapętleniem)
-	if (I2C_BusReset_Pending && bus_recovery.state == BUS_RECOVERY_IDLE) {
-		if (now - last_reset < 100) {
-			return; // Czekaj minimalnie 100ms między próbami recovery
-		}
-		last_reset = now;
-		I2C_BusReset_Pending = 0;
-		bus_recovery.state = BUS_RECOVERY_DISABLE_I2C;
-		bus_recovery.pulse_count = 0;
-		bus_recovery.last_time = now;
-	}
-
-	// Maszyna stanów dla nieblokującego recovery (każdy krok co 1ms)
-	switch (bus_recovery.state) {
-		case BUS_RECOVERY_IDLE:
-			// Stan bezczynności - czekanie na błąd I2C
-			break;
-
-		case BUS_RECOVERY_DISABLE_I2C:
-			// Krok 1: Wyłączenie peryferii I2C STM32
-			__HAL_I2C_DISABLE(&hi2c1);
-			bus_recovery.state = BUS_RECOVERY_CONFIG_GPIO;
-			break;
-
-		case BUS_RECOVERY_CONFIG_GPIO: {
-			// Krok 2: Rekonfiguracja pinów I2C jako GPIO (Open-Drain z pull-up)
-			GPIO_InitTypeDef GPIO_InitStruct = {0};
-			GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7; // PB6=SCL, PB7=SDA
-			GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;     // Open-Drain (jak I2C)
-			GPIO_InitStruct.Pull = GPIO_PULLUP;             // Pull-up
-			GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-			HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-			bus_recovery.pulse_count = 0;
-			bus_recovery.last_time = now;
-			bus_recovery.state = BUS_RECOVERY_PULSE_LOW;
-			break;
-		}
-
-		case BUS_RECOVERY_PULSE_LOW:
-			// Krok 3a: Generowanie pulsów zegarowych - faza LOW (czekaj 1ms)
-			if (now - bus_recovery.last_time >= 1) {
-				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET); // SCL LOW
-				bus_recovery.last_time = now;
-				bus_recovery.state = BUS_RECOVERY_PULSE_HIGH;
-			}
-			break;
-
-		case BUS_RECOVERY_PULSE_HIGH:
-			// Krok 3b: Generowanie pulsów zegarowych - faza HIGH (czekaj 1ms)
-			// Powtarzamy 9 razy aby slave mógł zakończyć przerwane wysyłanie
-			if (now - bus_recovery.last_time >= 1) {
-				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);   // SCL HIGH
-				bus_recovery.last_time = now;
-				bus_recovery.pulse_count++;
-				if (bus_recovery.pulse_count >= 9) {
-					// 9 pulsów zakończone - przejdź do generowania STOP condition
-					bus_recovery.state = BUS_RECOVERY_STOP_SDA_LOW;
-				} else {
-					// Kolejny puls
-					bus_recovery.state = BUS_RECOVERY_PULSE_LOW;
-				}
-			}
-			break;
-
-		case BUS_RECOVERY_STOP_SDA_LOW:
-			// Krok 4a: STOP condition - ustaw SDA na LOW (czekaj 1ms)
-			if (now - bus_recovery.last_time >= 1) {
-				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET); // SDA LOW
-				bus_recovery.last_time = now;
-				bus_recovery.state = BUS_RECOVERY_STOP_SCL_HIGH;
-			}
-			break;
-
-		case BUS_RECOVERY_STOP_SCL_HIGH:
-			// Krok 4b: STOP condition - ustaw SCL na HIGH (czekaj 1ms)
-			if (now - bus_recovery.last_time >= 1) {
-				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);   // SCL HIGH
-				bus_recovery.last_time = now;
-				bus_recovery.state = BUS_RECOVERY_STOP_SDA_HIGH;
-			}
-			break;
-
-		case BUS_RECOVERY_STOP_SDA_HIGH:
-			// Krok 4c: STOP condition - ustaw SDA na HIGH (przejście LOW→HIGH = STOP)
-			if (now - bus_recovery.last_time >= 1) {
-				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);   // SDA HIGH
-				bus_recovery.last_time = now;
-				bus_recovery.state = BUS_RECOVERY_RESTORE_I2C;
-			}
-			break;
-
-		case BUS_RECOVERY_RESTORE_I2C:
-			// Krok 5: Przywrócenie konfiguracji I2C i powrót do normalnej pracy
-			if (now - bus_recovery.last_time >= 1) {
-				HAL_I2C_DeInit(&hi2c1);  // Deinicjalizacja I2C
-				HAL_I2C_Init(&hi2c1);    // Reinicjalizacja I2C (piny wrócą do funkcji AF)
-				bus_recovery.state = BUS_RECOVERY_IDLE; // Gotowe - czekaj na kolejny błąd
-			}
-			break;
-
-		default:
-			// Zabezpieczenie - nieprawidłowy stan
-			bus_recovery.state = BUS_RECOVERY_IDLE;
-			break;
 	}
 }
 
