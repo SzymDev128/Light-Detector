@@ -1,6 +1,6 @@
 ../Core/Src/protocol.c:28:9:is_digits_only	24	static
 ../Core/Src/protocol.c:40:9:is_addr_char_valid	16	static
 ../Core/Src/protocol.c:47:6:send_response_frame	624	static
-../Core/Src/protocol.c:106:6:handle_command	384	static
-../Core/Src/protocol.c:297:6:validate_frame	584	static
-../Core/Src/protocol.c:383:6:process_uart_buffer	16	static
+../Core/Src/protocol.c:113:6:handle_command	384	static
+../Core/Src/protocol.c:299:6:validate_frame	584	static
+../Core/Src/protocol.c:390:6:process_uart_buffer	16	static

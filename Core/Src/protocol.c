@@ -141,11 +141,8 @@ void handle_command(char *cmd, const char *src_addr, const char *dst_addr, const
 			send_response_frame(device_addr, src_addr, id, "03");
 			return;
 		}
-		measurement_entry_t *entry = LightBuffer_GetByIndexOldest(count - 1);
-		if (!entry) {
-			send_response_frame(device_addr, src_addr, id, "03");
-			return;
-		}
+		measurement_entry_t *entry = LightBuffer_GetLatest();
+
 		uint32_t lux_val = (uint32_t)(entry->lux + 0.5f);
 		if (lux_val > 65535) {
 			lux_val = 65535;
@@ -167,15 +164,16 @@ void handle_command(char *cmd, const char *src_addr, const char *dst_addr, const
 		}
 		uint16_t start_offset = (params[0] - '0') * 100 + (params[1] - '0') * 10 + (params[2] - '0');
 		uint16_t count_req = (params[3] - '0') * 100 + (params[4] - '0') * 10 + (params[5] - '0');
-		if (count_req == 0) {
-			send_response_frame(device_addr, src_addr, id, "01");
-			return;
-		}
 		uint16_t count = (uint16_t)LightBuffer_GetCount();
-		
 		if (start_offset >= count) {
 			send_response_frame(device_addr, src_addr, id, "03");
 			return;
+		}
+		// pobranie wszystkich danych z bufora dla '000000'
+		if (start_offset == 0 && count_req == 0) {
+			count_req = count;
+		} else if (count_req == 0) {
+			count_req = count - start_offset;
 		}
 		
 		#define MAX_MEASUREMENTS_PER_FRAME 50
@@ -264,9 +262,6 @@ void handle_command(char *cmd, const char *src_addr, const char *dst_addr, const
 			case 4: mode_value = BH1750_ONETIME_HIGH_RES_MODE; break;
 			case 5: mode_value = BH1750_ONETIME_HIGH_RES_MODE_2; break;
 			case 6: mode_value = BH1750_ONETIME_LOW_RES_MODE; break;
-			default:
-				send_response_frame(device_addr, src_addr, id, "01");
-				return;
 		}
 		HAL_StatusTypeDef status = BH1750_SetMode(mode_value);
 		if (status == HAL_OK) {
@@ -303,8 +298,8 @@ void handle_command(char *cmd, const char *src_addr, const char *dst_addr, const
  */
 void validate_frame(char *f, uint16_t flen) {
 	char src[4], dst[4], id[3], len_str[4];
-	
-	if (flen < 13) {
+
+	if (flen < 15) {
 		USART_fsend("ERR: TOO SHORT\r\n");
 		return;
 	}
@@ -314,6 +309,11 @@ void validate_frame(char *f, uint16_t flen) {
 	memcpy(dst, &f[pos], 3); dst[3] = 0; pos += 3;
 	memcpy(id,  &f[pos], 2); id[2] = 0;  pos += 2;
 	memcpy(len_str, &f[pos], 3); len_str[3] = 0; pos += 3;
+
+	// Odrzucaj ramki nie skierowane do 'STM'
+	if (strcmp(dst, "STM") != 0) {
+		return;
+	}
 
 	for (uint8_t i = 0; i < 3; i++) {
 		if (!is_addr_char_valid(src[i]) || !is_addr_char_valid(dst[i])) {
