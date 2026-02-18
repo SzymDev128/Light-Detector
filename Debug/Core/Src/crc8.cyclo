@@ -1,0 +1,4 @@
+../Core/Src/crc8.c:15:9:is_hex_char	7
+../Core/Src/crc8.c:25:9:hex2byte	13
+../Core/Src/crc8.c:41:9:crc8	4
+../Core/Src/crc8.c:60:6:byte2hex	1

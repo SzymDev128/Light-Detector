@@ -49,28 +49,35 @@ void send_response_frame(const char *src_addr, const char *dst_addr, const char 
 	uint16_t pos = 0;
 	uint8_t crc_buf[300];
 	uint16_t crc_pos = 0;
-	
-	frame[pos++] = '&';
-	
-	memcpy(&frame[pos], src_addr, 3);
-	pos += 3;
-	memcpy(&crc_buf[crc_pos], src_addr, 3);
-	crc_pos += 3;
-	
-	memcpy(&frame[pos], dst_addr, 3);
-	pos += 3;
-	memcpy(&crc_buf[crc_pos], dst_addr, 3);
-	crc_pos += 3;
-	
-	memcpy(&frame[pos], id, 2);
-	pos += 2;
-	memcpy(&crc_buf[crc_pos], id, 2);
-	crc_pos += 2;
-	
+
 	uint16_t data_len = strlen(data);
 	if (data_len > 256) {
 		return;
 	}
+
+	uint16_t total_len = 1 + 3 + 3 + 2 + 3 + data_len + 2 + 1 + 1;
+	if (total_len > sizeof(frame)) {
+		// Przekroczenie bufora ramki
+		return;
+	}
+
+	frame[pos++] = '&';
+
+	memcpy(&frame[pos], src_addr, 3);
+	pos += 3;
+	memcpy(&crc_buf[crc_pos], src_addr, 3);
+	crc_pos += 3;
+
+	memcpy(&frame[pos], dst_addr, 3);
+	pos += 3;
+	memcpy(&crc_buf[crc_pos], dst_addr, 3);
+	crc_pos += 3;
+
+	memcpy(&frame[pos], id, 2);
+	pos += 2;
+	memcpy(&crc_buf[crc_pos], id, 2);
+	crc_pos += 2;
+
 	char len_str[4];
 	len_str[0] = '0' + (data_len / 100) % 10;
 	len_str[1] = '0' + (data_len / 10) % 10;
@@ -80,23 +87,23 @@ void send_response_frame(const char *src_addr, const char *dst_addr, const char 
 	pos += 3;
 	memcpy(&crc_buf[crc_pos], len_str, 3);
 	crc_pos += 3;
-	
+
 	memcpy(&frame[pos], data, data_len);
 	pos += data_len;
 	memcpy(&crc_buf[crc_pos], data, data_len);
 	crc_pos += data_len;
-	
+
 	uint8_t crc = crc8(crc_buf, crc_pos);
 	char crc_hex[3];
 	byte2hex(crc, crc_hex);
 	crc_hex[2] = 0;
-	
+
 	memcpy(&frame[pos], crc_hex, 2);
 	pos += 2;
-	
+
 	frame[pos++] = '*';
 	frame[pos] = 0;
-	
+
 	USART_fsend("%s", frame);
 }
 
@@ -105,15 +112,15 @@ void send_response_frame(const char *src_addr, const char *dst_addr, const char 
  */
 void handle_command(char *cmd, const char *src_addr, const char *dst_addr, const char *id) {
 	const char *device_addr = dst_addr;
-	
+
 	const uint16_t MIN_INTERVAL = 1;
 	const uint16_t MAX_INTERVAL = 9999;
-	
+
 	if (strlen(cmd) < 2 || !is_digits_only(cmd, 2)) {
 		USART_fsend("ERR: INVALID CMD\r\n");
 		return;
 	}
-	
+
 	uint8_t cmd_code = (cmd[0] - '0') * 10 + (cmd[1] - '0');
 	const char *params = (strlen(cmd) > 2) ? &cmd[2] : "";
 	
@@ -129,72 +136,75 @@ void handle_command(char *cmd, const char *src_addr, const char *dst_addr, const
 	}
 	// 12 - DOWNLOAD (last measurement)
 	else if (cmd_code == 12) {
-		uint16_t count = Measurement_GetCount();
+		uint16_t count = (uint16_t)LightBuffer_GetCount();
 		if (count == 0) {
 			send_response_frame(device_addr, src_addr, id, "03");
 			return;
 		}
-		measurement_entry_t *entry = Measurement_GetEntry(count - 1);
+		measurement_entry_t *entry = LightBuffer_GetByIndexOldest(count - 1);
 		if (!entry) {
 			send_response_frame(device_addr, src_addr, id, "03");
 			return;
 		}
 		uint32_t lux_val = (uint32_t)(entry->lux + 0.5f);
-		if (lux_val > 9999) {
-			lux_val = 9999;
+		if (lux_val > 65535) {
+			lux_val = 65535;
 		}
-		char response[5];
-		response[0] = '0' + (lux_val / 1000) % 10;
-		response[1] = '0' + (lux_val / 100) % 10;
-		response[2] = '0' + (lux_val / 10) % 10;
-		response[3] = '0' + lux_val % 10;
-		response[4] = 0;
+		char response[6];
+		response[0] = '0' + (lux_val / 10000) % 10;
+		response[1] = '0' + (lux_val / 1000) % 10;
+		response[2] = '0' + (lux_val / 100) % 10;
+		response[3] = '0' + (lux_val / 10) % 10;
+		response[4] = '0' + lux_val % 10;
+		response[5] = 0;
 		send_response_frame(device_addr, src_addr, id, response);
 	}
-	// 13 - VIEW (+ xxzz parameters)
+	// 13 - VIEW (+ xxxzzz parameters)
 	else if (cmd_code == 13) {
-		if (strlen(params) < 4) {
+		if (strlen(params) < 6) {
 			send_response_frame(device_addr, src_addr, id, "01");
 			return;
 		}
-		uint8_t start_offset = (params[0] - '0') * 10 + (params[1] - '0');
-		uint8_t count_req = (params[2] - '0') * 10 + (params[3] - '0');
+		uint16_t start_offset = (params[0] - '0') * 100 + (params[1] - '0') * 10 + (params[2] - '0');
+		uint16_t count_req = (params[3] - '0') * 100 + (params[4] - '0') * 10 + (params[5] - '0');
 		if (count_req == 0) {
 			send_response_frame(device_addr, src_addr, id, "01");
 			return;
 		}
-		uint16_t count = Measurement_GetCount();
+		uint16_t count = (uint16_t)LightBuffer_GetCount();
 		
 		if (start_offset >= count) {
 			send_response_frame(device_addr, src_addr, id, "03");
 			return;
 		}
 		
-		#define MAX_MEASUREMENTS_PER_FRAME 63
+		#define MAX_MEASUREMENTS_PER_FRAME 50
 		char data_out[256];
-		uint8_t measurements_sent = 0;
+		uint16_t measurements_sent = 0;
 		
 		while (measurements_sent < count_req) {
-			uint8_t current_offset = start_offset + measurements_sent;
-			uint8_t batch_size = 0;
+			uint16_t current_offset = start_offset + measurements_sent;
+			uint16_t batch_size = 0;
 			uint16_t data_pos = 0;
 			
+			data_out[data_pos++] = '0' + (current_offset / 100) % 10;
 			data_out[data_pos++] = '0' + (current_offset / 10) % 10;
 			data_out[data_pos++] = '0' + current_offset % 10;
 			
-			for (uint8_t i = 0; i < MAX_MEASUREMENTS_PER_FRAME && measurements_sent < count_req; i++) {
+			for (uint16_t i = 0; i < MAX_MEASUREMENTS_PER_FRAME && measurements_sent < count_req; i++) {
 				int32_t idx = (int32_t)count - 1 - (int32_t)current_offset - (int32_t)i;
 				if (idx < 0) {
 					break;
 				}
-				measurement_entry_t *entry = Measurement_GetEntry((uint16_t)idx);
+				measurement_entry_t *entry = LightBuffer_GetByIndexOldest((uint16_t)idx);
 				if (!entry) {
 					break;
 				}
 				uint32_t lux_val = (uint32_t)(entry->lux + 0.5f);
-				if (lux_val > 9999) {
-					lux_val = 9999;
+				if (lux_val > 65535) {
+					lux_val = 65535;
 				}
+				data_out[data_pos++] = '0' + (lux_val / 10000) % 10;
 				data_out[data_pos++] = '0' + (lux_val / 1000) % 10;
 				data_out[data_pos++] = '0' + (lux_val / 100) % 10;
 				data_out[data_pos++] = '0' + (lux_val / 10) % 10;
@@ -268,7 +278,8 @@ void handle_command(char *cmd, const char *src_addr, const char *dst_addr, const
 	// 17 - GET_MODE
 	else if (cmd_code == 17) {
 		char mode_char = '1';
-		switch (bh1750_current_mode) {
+		uint8_t current_mode = BH1750_GetCurrentMode();
+		switch (current_mode) {
 			case BH1750_CONTINUOUS_HIGH_RES_MODE: mode_char = '1'; break;
 			case BH1750_CONTINUOUS_HIGH_RES_MODE_2: mode_char = '2'; break;
 			case BH1750_CONTINUOUS_LOW_RES_MODE: mode_char = '3'; break;
@@ -327,27 +338,22 @@ void validate_frame(char *f, uint16_t flen) {
 		USART_fsend("ERR_LENGTH\r\n");
 		return;
 	}
-
-	uint16_t data_start = pos;
 	
-	if (flen < (data_start + data_len_declared + 3)) {
-		USART_fsend("ERR_LENGTH\r\n");
+	// Sprawdzenie czy rzeczywista długość pola DATA odpowiada zadeklarowanej (LEN)
+	uint16_t actual_data_len = flen - pos - 3;
+	
+	if (actual_data_len != data_len_declared) {
+		USART_fsend("ERR: DATA LENGTH MISMATCH\r\n");
 		return;
 	}
-	
-	uint16_t crc_pos = data_start + data_len_declared;
-	uint16_t data_len_real = data_len_declared;
+
+	uint16_t crc_pos = pos + data_len_declared;
 
 	char data[257];
-	memcpy(data, &f[data_start], data_len_real);
-	data[data_len_real] = 0;
+	memcpy(data, &f[pos], data_len_declared);
+	data[data_len_declared] = 0;
 
-	if (!is_digits_only(data, data_len_real)) {
-		USART_fsend("ERR\r\n");
-		return;
-	}
-
-	if (flen < (crc_pos + 2)) {
+	if (!is_digits_only(data, data_len_declared)) {
 		USART_fsend("ERR\r\n");
 		return;
 	}
@@ -366,7 +372,7 @@ void validate_frame(char *f, uint16_t flen) {
 	memcpy(&buf[p], dst, 3); p += 3;
 	memcpy(&buf[p], id, 2);  p += 2;
 	memcpy(&buf[p], len_str, 3); p += 3;
-	memcpy(&buf[p], data, data_len_real); p += data_len_real;
+	memcpy(&buf[p], data, data_len_declared); p += data_len_declared;
 
 	uint8_t calc_crc = crc8(buf, p);
 
@@ -382,34 +388,42 @@ void validate_frame(char *f, uint16_t flen) {
  * @brief Process UART buffer and extract frames
  */
 void process_uart_buffer(void) {
-    while (USART_kbhit()) {
-        char c = USART_getchar();
+	while (USART_kbhit()) {
+		char c = USART_getchar();
 
-        switch (st) {
-        case ST_IDLE:
-            if (c == '&') {
-                pos = 0;
-                frame[pos++] = c;
-                st = ST_COLLECT;
-            }
-            break;
+		switch (st) {
+			case ST_IDLE: {
+				if (c == '&') {
+					pos = 0;
+					frame[pos++] = c;
+					st = ST_COLLECT;
+				}
+				break;
+			}
 
-        case ST_COLLECT:
-            if (c == '&') {
-                pos = 0;
-                frame[pos++] = c;
-                break;
-            }
+			case ST_COLLECT: {
+				if (c == '&') {
+					pos = 0;
+					frame[pos++] = c;
+					break;
+				}
 
-            if (pos < sizeof(frame) - 1)
-                frame[pos++] = c;
+				if (pos < sizeof(frame) - 1) {
+					frame[pos++] = c;
+				} else {
+					// Buffer overflow: odrzucamy ramkę i wracamy do ST_IDLE
+					pos = 0;
+					st = ST_IDLE;
+					break;
+				}
 
-            if (c == '*') {
-                frame[pos] = 0;
-                validate_frame(frame, pos);
-                st = ST_IDLE;
-            }
-            break;
-        }
-    }
+				if (c == '*') {
+					frame[pos] = 0;
+					validate_frame(frame, pos);
+					st = ST_IDLE;
+				}
+				break;
+			}
+		}
+	}
 }

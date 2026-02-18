@@ -1,0 +1,4 @@
+../Core/Src/crc8.c:15:9:is_hex_char	16	static
+../Core/Src/crc8.c:25:9:hex2byte	24	static
+../Core/Src/crc8.c:41:9:crc8	24	static
+../Core/Src/crc8.c:60:6:byte2hex	16	static

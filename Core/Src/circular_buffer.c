@@ -26,11 +26,11 @@ __IO int USART_RX_Busy = 0;  // Odbieranie tail
 
 __IO uint8_t USART_RxBufOverflow = 0;
 
-/* I2C Buffers */
-uint8_t I2C_TxBuf[I2C_TXBUF_LEN];
-uint8_t I2C_RxBuf[I2C_RXBUF_LEN];
-
-__IO uint8_t I2C_Error = 0;
+/* Light Buffer */
+static measurement_entry_t LightBuffer[LIGHT_BUFFER_SIZE];
+static volatile uint32_t LightBuffer_WritePos = 0;
+static volatile uint32_t LightBuffer_Count = 0;
+static volatile uint8_t LightBuffer_DataAvailable = 0;
 
 /**
  * @brief Check if USART receive buffer has data
@@ -65,7 +65,7 @@ int16_t USART_getchar(void) {
  * @param format: Format string (like printf)
  */
 void USART_fsend(char *format, ...) {
-	char tmp_rs[300];
+	char tmp_rs[560];
 	int i;
 	__IO int idx;
 	va_list arglist;
@@ -94,33 +94,58 @@ void USART_fsend(char *format, ...) {
 	__enable_irq();
 }
 
-/**
- * @brief UART transmit complete callback
- */
-void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
-	if (huart == &huart2) {
-		if (USART_TX_Empty != USART_TX_Busy) {
-			uint8_t tmp = USART_TxBuf[USART_TX_Busy];
-			USART_TX_Busy++;
-			if (USART_TX_Busy >= USART_TXBUF_LEN)
-				USART_TX_Busy = 0;
-			HAL_UART_Transmit_IT(&huart2, &tmp, 1);
-		}
+uint8_t LightBuffer_Put(float lux) {
+	__disable_irq();
+
+	LightBuffer[LightBuffer_WritePos].lux = lux;
+	LightBuffer_WritePos = (LightBuffer_WritePos + 1) % LIGHT_BUFFER_SIZE;
+	if (LightBuffer_Count < LIGHT_BUFFER_SIZE) {
+		LightBuffer_Count++;
 	}
+	LightBuffer_DataAvailable = 1;
+	__enable_irq();
+	return 1;
 }
 
-/**
- * @brief UART receive complete callback
- */
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-	if (huart == &huart2) {
-		int next_head = (USART_RX_Empty + 1) % USART_RXBUF_LEN;
-		if (next_head == USART_RX_Busy) {
-			USART_RxBufOverflow = 1;
-		} else {
-			USART_RxBuf[USART_RX_Empty] = rx_byte;
-			USART_RX_Empty = next_head;
-		}
-		HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
+measurement_entry_t* LightBuffer_GetLatest(void) {
+	if (!LightBuffer_DataAvailable) {
+		return NULL;
+	}
+	uint32_t latest_index = (LightBuffer_WritePos == 0)
+			? (LIGHT_BUFFER_SIZE - 1)
+			: (LightBuffer_WritePos - 1);
+	return &LightBuffer[latest_index];
+}
+
+uint32_t LightBuffer_GetCount(void) {
+	return LightBuffer_Count;
+}
+
+measurement_entry_t* LightBuffer_GetByOffset(uint16_t offset) {
+	if (!LightBuffer_DataAvailable) {
+		return NULL;
+	}
+	uint32_t count = LightBuffer_Count;
+	if (count == 0 || offset >= count) {
+		return NULL;
+	}
+	uint32_t actual_index = (LightBuffer_WritePos - 1 - offset + LIGHT_BUFFER_SIZE)
+			% LIGHT_BUFFER_SIZE;
+	return &LightBuffer[actual_index];
+}
+
+measurement_entry_t* LightBuffer_GetByIndexOldest(uint16_t index) {
+	uint32_t count = LightBuffer_Count;
+	if (count == 0 || index >= count) {
+		return NULL;
+	}
+	uint32_t offset_from_latest = (count - 1U) - index;
+	return LightBuffer_GetByOffset((uint16_t)offset_from_latest);
+}
+
+void Measurement_FillTestData(void) {
+	for (uint16_t i = 1; i <= 2500; i++) {
+		float lux_value = 100.0f + (float)i;
+		LightBuffer_Put(lux_value);
 	}
 }

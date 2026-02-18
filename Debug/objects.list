@@ -1,4 +1,8 @@
+"./Core/Src/bh1750.o"
+"./Core/Src/circular_buffer.o"
+"./Core/Src/crc8.o"
 "./Core/Src/main.o"
+"./Core/Src/protocol.o"
 "./Core/Src/stm32f4xx_hal_msp.o"
 "./Core/Src/stm32f4xx_it.o"
 "./Core/Src/syscalls.o"

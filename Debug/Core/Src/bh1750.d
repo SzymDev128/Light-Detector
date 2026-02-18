@@ -1,4 +1,4 @@
-Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
+Core/Src/bh1750.o: ../Core/Src/bh1750.c ../Core/Inc/bh1750.h \
  ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal.h \
  ../Core/Inc/stm32f4xx_hal_conf.h \
  ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_rcc.h \
@@ -29,9 +29,8 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
  ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_tim.h \
  ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_tim_ex.h \
  ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_uart.h \
- ../Core/Inc/circular_buffer.h ../Core/Inc/bh1750.h ../Core/Inc/crc8.h \
- ../Core/Inc/protocol.h ../Core/Inc/bh1750.h
-../Core/Inc/main.h:
+ ../Core/Inc/circular_buffer.h ../Core/Inc/bh1750.h ../Core/Inc/main.h
+../Core/Inc/bh1750.h:
 ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal.h:
 ../Core/Inc/stm32f4xx_hal_conf.h:
 ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_rcc.h:
@@ -64,6 +63,4 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
 ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_uart.h:
 ../Core/Inc/circular_buffer.h:
 ../Core/Inc/bh1750.h:
-../Core/Inc/crc8.h:
-../Core/Inc/protocol.h:
-../Core/Inc/bh1750.h:
+../Core/Inc/main.h:
