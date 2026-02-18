@@ -5,6 +5,6 @@
 ../Core/Src/bh1750.c:217:6:Measurement_SetInterval	1
 ../Core/Src/bh1750.c:224:10:Measurement_GetInterval	1
 ../Core/Src/bh1750.c:231:6:Measurement_EnableAutoRead	2
-../Core/Src/bh1750.c:241:6:Measurement_AutoRead_Process	16
-../Core/Src/bh1750.c:323:6:HAL_I2C_MasterRxCpltCallback	6
-../Core/Src/bh1750.c:369:6:HAL_I2C_ErrorCallback	2
+../Core/Src/bh1750.c:241:6:Measurement_AutoRead_Process	23
+../Core/Src/bh1750.c:352:6:HAL_I2C_MasterRxCpltCallback	6
+../Core/Src/bh1750.c:398:6:HAL_I2C_ErrorCallback	2

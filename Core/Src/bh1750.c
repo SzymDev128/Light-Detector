@@ -61,7 +61,7 @@ static uint8_t bh1750_power_on_cmd = 0x01;
  * @retval 1 jeśli One Time, 0 jeśli Continuous
  */
 static uint8_t is_onetime_mode(uint8_t mode) {
-	return (mode == 0x20 || mode == 0x21 || mode == 0x23);
+	return (mode == BH1750_ONETIME_HIGH_RES_MODE || mode == BH1750_ONETIME_HIGH_RES_MODE_2 || mode == BH1750_ONETIME_LOW_RES_MODE);
 }
 
 /**
@@ -137,7 +137,7 @@ void BH1750_Init_Process(void) {
 				bh1750_state = BH1750_STATE_READY;
 			} else {
 				// Tryb Continuous: czekaj 120ms (H-Res modes) lub 16ms (L-Res mode) po wysłaniu komendy trybu
-				uint32_t wait_time = (bh1750_current_mode == 0x13) ? 16 : 120;
+				uint32_t wait_time = (bh1750_current_mode == BH1750_CONTINUOUS_LOW_RES_MODE) ? 16 : 120;
 				if ((HAL_GetTick() - bh1750_state_tick) >= wait_time) {
 					bh1750_state = BH1750_STATE_READY;
 				}
@@ -147,7 +147,7 @@ void BH1750_Init_Process(void) {
 	
 		case BH1750_STATE_MEASURING: {
 			// Czekanie po wysłaniu komendy trybu One Time (120ms dla H-Res/H-Res2, 16ms dla L-Res)
-			uint32_t wait_time = (bh1750_current_mode == 0x23) ? 16 : 120;
+			uint32_t wait_time = (bh1750_current_mode == BH1750_ONETIME_LOW_RES_MODE) ? 16 : 120;
 			if ((HAL_GetTick() - bh1750_state_tick) >= wait_time) {
 				bh1750_state = BH1750_STATE_READY;
 			}
@@ -245,71 +245,100 @@ void Measurement_AutoRead_Process(void) {
 	
 	// Tryb One Time: wyzwolenie pomiaru wysłaniem komendy trybu
 	if (is_onetime_mode(bh1750_current_mode)) {
-		if (bh1750_state == BH1750_STATE_READY && onetime_meas_phase == 0) {
-			// Wysłanie komendy trybu do uruchomienia pomiaru (automatycznie zatrzymuje się po 120ms/16ms)
-			if (HAL_I2C_Master_Transmit_IT(&hi2c1, bh1750_addr << 1, &bh1750_current_mode, 1) == HAL_OK) {
-				bh1750_state = BH1750_STATE_MEASURING;
-				bh1750_state_tick = HAL_GetTick();
-				onetime_phase_tick = HAL_GetTick();
-				onetime_meas_phase = 1;
+		switch (onetime_meas_phase) {
+			case 0: {
+				if (bh1750_state == BH1750_STATE_READY) {
+					static uint8_t phase0_first_entry = 1;
+					if (phase0_first_entry) {
+						onetime_phase_tick = HAL_GetTick();
+						phase0_first_entry = 0;
+					}
+					if (HAL_I2C_Master_Transmit_IT(&hi2c1, bh1750_addr << 1, &bh1750_current_mode, 1) == HAL_OK) {
+						bh1750_state = BH1750_STATE_MEASURING;
+						onetime_meas_phase = 1;
+						phase0_first_entry = 1;
+					} else if ((HAL_GetTick() - onetime_phase_tick) > 500) {
+						LightBuffer_Put(0.0f);
+						measurement_auto.enabled = 0;
+						onetime_meas_phase = 0;
+						phase0_first_entry = 1;
+					}
+					return;
+				}
+				break;
 			}
-			return;
-		}
-		
-		if (onetime_meas_phase == 1) {
-			// Czekanie na zakończenie pomiaru (120ms dla H-Res, 16ms dla L-Res)
-			if (bh1750_state == BH1750_STATE_READY) {
-				// Pomiar ukończony, gotowy do odczytu
-				onetime_phase_tick = HAL_GetTick();
-				onetime_meas_phase = 2;
-			} else if ((HAL_GetTick() - onetime_phase_tick) > 500) {
-				// Timeout - pomiar nie ukończony w rozsądnym czasie
-				LightBuffer_Put(0.0f);
-				measurement_auto.enabled = 0;
-				onetime_meas_phase = 0;
-			}
-			return;
-		}
-		
-		if (onetime_meas_phase == 2) {
-			// Odczyt wyniku pomiaru
-			if (bh1750_state == BH1750_STATE_READY) {
-				bh1750_state = BH1750_STATE_BUSY;
-				bh1750_state_tick = HAL_GetTick();  // Timestamp dla timeout
-				HAL_StatusTypeDef status = HAL_I2C_Master_Receive_IT(&hi2c1, (bh1750_addr << 1) | 0x01, bh1750_read_buffer, 2);
-				
-				if (status != HAL_OK) {
-					bh1750_state = BH1750_STATE_READY;
+			case 1: {
+				   // Flaga statyczna: ustawiona na 1 tylko przy pierwszym wejściu do fazy 1
+				   static uint8_t phase1_first_entry = 1;
+				   // Ustaw znacznik czasu timeoutu tylko raz na wejściu do fazy 1
+				   if (phase1_first_entry) {
+					   onetime_phase_tick = HAL_GetTick(); // Start odliczania timeoutu oczekiwania na zakończenie pomiaru
+					   phase1_first_entry = 0; // Wyłącz, aby nie nadpisywać znacznika w kolejnych przebiegach
+				   }
+				if (bh1750_state == BH1750_STATE_READY) {
+					onetime_meas_phase = 2;
+					phase1_first_entry = 1;
+				} else if ((HAL_GetTick() - onetime_phase_tick) > 500) {
 					LightBuffer_Put(0.0f);
 					measurement_auto.enabled = 0;
 					onetime_meas_phase = 0;
+					phase1_first_entry = 1;
 				}
-			} 
-			else if ((HAL_GetTick() - onetime_phase_tick) > 500) {
-				// Timeout - odczyt nie ukończony
-				LightBuffer_Put(0.0f);
-				measurement_auto.enabled = 0;
-				onetime_meas_phase = 0;
-				bh1750_state = BH1750_STATE_READY;
+				return;
 			}
-			return;
+			case 2: {
+				static uint8_t phase2_first_entry = 1;
+				if (phase2_first_entry) {
+					onetime_phase_tick = HAL_GetTick();
+					phase2_first_entry = 0;
+				}
+				if (bh1750_state == BH1750_STATE_READY) {
+					bh1750_state = BH1750_STATE_BUSY;
+					HAL_StatusTypeDef status = HAL_I2C_Master_Receive_IT(&hi2c1, (bh1750_addr << 1) | 0x01, bh1750_read_buffer, 2);
+					if (status != HAL_OK) {
+						bh1750_state = BH1750_STATE_READY;
+						LightBuffer_Put(0.0f);
+						measurement_auto.enabled = 0;
+						onetime_meas_phase = 0;
+					}
+					phase2_first_entry = 1;
+				} else if ((HAL_GetTick() - onetime_phase_tick) > 500) {
+					LightBuffer_Put(0.0f);
+					measurement_auto.enabled = 0;
+					onetime_meas_phase = 0;
+					bh1750_state = BH1750_STATE_READY;
+					phase2_first_entry = 1;
+				}
+				return;
+			}
+			default:
+				break;
 		}
 	}
 	
-	// Tryb Continuous: wyzwolenie okresowych pomiarów
-	if (bh1750_state != BH1750_STATE_READY) {
+	// Tryb Continuous: obsługa timeoutu i cyklicznego odczytu
+	if (bh1750_state == BH1750_STATE_BUSY) {
+		// Obsługa timeoutu na odczyt
+		if ((HAL_GetTick() - bh1750_state_tick) > 500) {
+			bh1750_state = BH1750_STATE_READY;
+			LightBuffer_Put(0.0f);
+		}
 		return;
 	}
 	
+	if (bh1750_state != BH1750_STATE_READY) {
+		return;
+	}
+
 	uint32_t current_time = HAL_GetTick();
 	if ((current_time - measurement_auto.last_measurement) >= measurement_auto.interval_ms) {
 		measurement_auto.last_measurement = current_time;
-		
+
 		// Wysłanie komendy odczytu
 		bh1750_state = BH1750_STATE_BUSY;
 		bh1750_state_tick = HAL_GetTick();  // Timestamp dla timeout
 		HAL_StatusTypeDef status = HAL_I2C_Master_Receive_IT(&hi2c1, (bh1750_addr << 1) | 0x01, bh1750_read_buffer, 2);
-		
+
 		if (status != HAL_OK) {
 			bh1750_state = BH1750_STATE_READY;
 			LightBuffer_Put(0.0f);
@@ -332,18 +361,18 @@ void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c) {
 		// Select divider based on measurement mode
 		float lux_divider;
 		switch (bh1750_current_mode) {
-			case 0x11:  // Continuous H-Res Mode2
-			case 0x21:  // One Time H-Res Mode2
+			case BH1750_CONTINUOUS_HIGH_RES_MODE_2:  // Continuous H-Res Mode2
+			case BH1750_ONETIME_HIGH_RES_MODE_2:     // One Time H-Res Mode2
 				lux_divider = 2.4f;  // 0.5 lx resolution
 				break;
 			
-			case 0x13:  // Continuous L-Res Mode
-			case 0x23:  // One Time L-Res Mode
+			case BH1750_CONTINUOUS_LOW_RES_MODE:      // Continuous L-Res Mode
+			case BH1750_ONETIME_LOW_RES_MODE:         // One Time L-Res Mode
 				lux_divider = 0.5f;  // 4 lx resolution
 				break;
 			
-			case 0x10:  // Continuous H-Res Mode
-			case 0x20:  // One Time H-Res Mode
+			case BH1750_CONTINUOUS_HIGH_RES_MODE:     // Continuous H-Res Mode
+			case BH1750_ONETIME_HIGH_RES_MODE:        // One Time H-Res Mode
 			default:
 				lux_divider = 1.2f;  // 1 lx resolution
 				break;
